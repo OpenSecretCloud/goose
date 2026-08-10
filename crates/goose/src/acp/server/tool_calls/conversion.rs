@@ -700,6 +700,7 @@ mod tests {
             id: "req_1".to_string(),
             tool_result: Ok(result),
             metadata: None,
+            provenance: Default::default(),
         }
     }
 
@@ -772,6 +773,7 @@ mod tests {
             id: "req_1".to_string(),
             tool_result,
             metadata: None,
+            provenance: Default::default(),
         }
     }
 

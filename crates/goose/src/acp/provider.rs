@@ -18,7 +18,7 @@ use async_stream::try_stream;
 use futures::future::BoxFuture;
 use goose_providers::conversation::token_usage::{ProviderUsage, Usage};
 use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock as RmcpContent, Role, Tool};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -35,7 +35,9 @@ use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt 
 use crate::acp::{map_permission_response, PermissionDecision};
 use crate::config::{ExtensionConfig, GooseMode};
 use crate::context_mgmt::format_message_for_compacting;
-use crate::conversation::message::{Message, MessageContent, TOOL_META_EXTERNAL_DISPATCH_KEY};
+use crate::conversation::message::{
+    Message, MessageContent, ToolResponseProvenance, TOOL_META_EXTERNAL_DISPATCH_KEY,
+};
 use crate::conversation::Conversation;
 use crate::permission::permission_confirmation::PrincipalType;
 use crate::permission::{Permission, PermissionConfirmation};
@@ -613,7 +615,7 @@ impl Provider for AcpProvider {
 
         Ok(Box::pin(try_stream! {
             let mut suppress_text = false;
-            let mut rejected_tool_calls: HashSet<String> = HashSet::new();
+            let mut rejected_tool_calls: HashMap<String, ToolResponseProvenance> = HashMap::new();
             // Stable id+timestamp per contiguous run so Desktop coalesces chunks into one bubble.
             let mut text_run: Option<(String, i64)> = None;
             let mut thought_run: Option<(String, i64)> = None;
@@ -644,7 +646,10 @@ impl Provider for AcpProvider {
                         thought_run = None;
                         if reject_all_tools {
                             suppress_text = true;
-                            rejected_tool_calls.insert(id);
+                            rejected_tool_calls.insert(
+                                id,
+                                ToolResponseProvenance::GooseDeniedBeforeExecution,
+                            );
                         } else {
                             let mut params = CallToolRequestParams::new(name);
                             if let Some(serde_json::Value::Object(map)) = raw_input {
@@ -675,7 +680,7 @@ impl Provider for AcpProvider {
                     } => {
                         text_run = None;
                         thought_run = None;
-                        if rejected_tool_calls.remove(&id) {
+                        if let Some(provenance) = rejected_tool_calls.remove(&id) {
                             // In chat mode no tool_request was emitted (suppressed at
                             // ToolCallStart), so surface a plain text message. In other
                             // modes a tool_request WAS emitted, so pair it with an error
@@ -686,10 +691,12 @@ impl Provider for AcpProvider {
                                     .with_generated_id();
                                 yield (Some(message), None);
                             } else {
-                                let denial = vec![RmcpContent::text("Tool call was denied.")];
-                                let result = CallToolResult::error(denial);
-                                let message =
-                                    Message::user().with_tool_response(id, Ok(result));
+                                let mut message = Message::user();
+                                message.add_goose_control_tool_response_with_metadata(
+                                    id,
+                                    provenance,
+                                    None,
+                                );
                                 yield (Some(message), None);
                             }
                         } else {
@@ -708,10 +715,16 @@ impl Provider for AcpProvider {
                         text_run = None;
                         thought_run = None;
                         if let Some(decision) = permission_decision_from_mode(goose_mode) {
-                            if decision.should_record_rejection() {
-                                rejected_tool_calls.insert(request.tool_call.tool_call_id.0.to_string());
+                            let response = map_permission_response(&request, decision);
+                            if let Some(provenance) =
+                                rejection_provenance(decision, &response.outcome)
+                            {
+                                rejected_tool_calls.insert(
+                                    request.tool_call.tool_call_id.0.to_string(),
+                                    provenance,
+                                );
                             }
-                            let _ = response_tx.send(map_permission_response(&request, decision));
+                            let _ = response_tx.send(response);
                             continue;
                         }
 
@@ -735,10 +748,16 @@ impl Provider for AcpProvider {
                         pending_confirmations.lock().await.remove(&request_id);
 
                         let decision = PermissionDecision::from(confirmation.permission);
-                        if decision.should_record_rejection() {
-                            rejected_tool_calls.insert(request.tool_call.tool_call_id.0.to_string());
+                        let response = map_permission_response(&request, decision);
+                        if let Some(provenance) =
+                            rejection_provenance(decision, &response.outcome)
+                        {
+                            rejected_tool_calls.insert(
+                                request.tool_call.tool_call_id.0.to_string(),
+                                provenance,
+                            );
                         }
-                        let _ = response_tx.send(map_permission_response(&request, decision));
+                        let _ = response_tx.send(response);
                     }
                     AcpUpdate::Complete(_reason, usage) => {
                         if let Some(usage) = usage {
@@ -1811,6 +1830,22 @@ fn permission_decision_from_mode(goose_mode: GooseMode) -> Option<PermissionDeci
     }
 }
 
+fn rejection_provenance(
+    decision: PermissionDecision,
+    outcome: &RequestPermissionOutcome,
+) -> Option<ToolResponseProvenance> {
+    match decision {
+        PermissionDecision::RejectAlways | PermissionDecision::RejectOnce => {
+            Some(ToolResponseProvenance::GooseDeniedBeforeExecution)
+        }
+        PermissionDecision::Cancel => Some(ToolResponseProvenance::GooseCancelledBeforeExecution),
+        PermissionDecision::AllowAlways | PermissionDecision::AllowOnce => match outcome {
+            RequestPermissionOutcome::Selected(_) => None,
+            _ => Some(ToolResponseProvenance::GooseCancelledBeforeExecution),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2634,6 +2669,41 @@ mod tests {
     #[test_case(GooseMode::SmartApprove => None ; "smart_approve defers")]
     fn test_permission_decision_from_mode(mode: GooseMode) -> Option<PermissionDecision> {
         permission_decision_from_mode(mode)
+    }
+
+    #[test_case(PermissionDecision::AllowOnce, false => None ; "selected allow is not recorded")]
+    #[test_case(
+        PermissionDecision::RejectOnce,
+        false => Some(ToolResponseProvenance::GooseDeniedBeforeExecution)
+        ; "selected reject is denied"
+    )]
+    #[test_case(
+        PermissionDecision::AllowOnce,
+        true => Some(ToolResponseProvenance::GooseCancelledBeforeExecution)
+        ; "unavailable allow option becomes cancellation"
+    )]
+    #[test_case(
+        PermissionDecision::RejectOnce,
+        true => Some(ToolResponseProvenance::GooseDeniedBeforeExecution)
+        ; "unavailable reject option preserves denial"
+    )]
+    #[test_case(
+        PermissionDecision::Cancel,
+        true => Some(ToolResponseProvenance::GooseCancelledBeforeExecution)
+        ; "explicit cancel stays distinct"
+    )]
+    fn test_rejection_provenance(
+        decision: PermissionDecision,
+        cancelled: bool,
+    ) -> Option<ToolResponseProvenance> {
+        let outcome = if cancelled {
+            RequestPermissionOutcome::Cancelled
+        } else {
+            RequestPermissionOutcome::Selected(
+                agent_client_protocol::schema::v1::SelectedPermissionOutcome::new("selected"),
+            )
+        };
+        rejection_provenance(decision, &outcome)
     }
 
     #[test_case(

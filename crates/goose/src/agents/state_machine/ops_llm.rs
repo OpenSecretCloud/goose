@@ -9,7 +9,9 @@ use crate::agents::state_machine::operation::{
 use crate::agents::state_machine::ops_unknown_tool::UNCLAIMED_TOOL_ERROR;
 use crate::agents::{ExtensionManager, PromptManager};
 use crate::config::GooseMode;
-use crate::conversation::message::{InferenceMetadata, Message, MessageContent};
+use crate::conversation::message::{
+    InferenceMetadata, Message, MessageContent, ToolResponseProvenance,
+};
 use crate::conversation::{effective_role, Conversation, EffectiveRole};
 use crate::providers::base::{Provider, ProviderUsage};
 use crate::session::Session;
@@ -24,8 +26,6 @@ use tracing_futures::Instrument;
 
 const EMPTY_RESPONSE_MESSAGE: &str =
     "The model returned an empty response. Please resend your message to continue.";
-const CANCELLED_TOOL_RESPONSE: &str = "Tool call was cancelled before execution";
-
 fn is_thinking(content: &MessageContent) -> bool {
     matches!(
         content,
@@ -244,11 +244,9 @@ impl Operation for InferenceRunner<'_> {
         let mut response = Message::user();
         for request in requests {
             if !answered.contains(&request.id) {
-                response.add_tool_response_with_metadata(
+                response.add_goose_control_tool_response_with_metadata(
                     request.id,
-                    Ok(rmcp::model::CallToolResult::error(vec![
-                        rmcp::model::ContentBlock::text(CANCELLED_TOOL_RESPONSE),
-                    ])),
+                    ToolResponseProvenance::GooseCancelledBeforeExecution,
                     request.metadata.as_ref(),
                 );
             }

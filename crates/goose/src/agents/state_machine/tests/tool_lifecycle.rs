@@ -8,10 +8,14 @@ use super::calculator_extension::{
 use super::pipeline::MessageKind::{Agent, Confirmation, ToolCall, ToolResponse};
 use super::pipeline::MAX_TURNS;
 use super::test_pipeline;
-use crate::agents::tool_execution::{CHAT_MODE_TOOL_SKIPPED_RESPONSE, DECLINED_RESPONSE};
+use crate::agents::tool_execution::{
+    CANCELLED_RESPONSE, CHAT_MODE_TOOL_SKIPPED_RESPONSE, DECLINED_RESPONSE,
+};
 use crate::config::permission::PermissionLevel;
 use crate::config::GooseMode;
-use crate::conversation::message::{Message, MessageContent};
+use crate::conversation::message::{
+    Message, MessageContent, ToolResponseProvenance, INTERRUPTED_RESPONSE,
+};
 use crate::permission::Permission;
 
 #[tokio::test]
@@ -254,7 +258,7 @@ async fn execution_recovers_from_timeout_cancellation_and_filtered_output() -> R
     let (result, ()) = tokio::join!(run, cancel_after_result);
     let result = result?;
     result.assert_message(-2, ToolResponse, "result: 1");
-    result.assert_message(-1, ToolResponse, "calculator call cancelled");
+    result.assert_message(-1, ToolResponse, INTERRUPTED_RESPONSE);
     assert_eq!(pipeline.calculator_total(), 1);
 
     api.on("continue after cancellation").call(ADD, value(1));
@@ -286,6 +290,21 @@ async fn execution_recovers_from_timeout_cancellation_and_filtered_output() -> R
     let pipeline = pipeline.reconstruct().await?;
     let result = pipeline.resume_cancelled().await?;
     result.assert_message(-1, ToolResponse, "cancelled before execution");
+    let cancelled_response = result
+        .conversation()
+        .messages()
+        .iter()
+        .flat_map(|message| &message.content)
+        .find_map(|content| match content {
+            MessageContent::ToolResponse(response) if response.id == "unfinished" => Some(response),
+            _ => None,
+        })
+        .expect("cancelled unfinished request has a terminal response");
+    assert_eq!(
+        cancelled_response.provenance,
+        ToolResponseProvenance::GooseCancelledBeforeExecution
+    );
+    assert!(cancelled_response.is_canonical_goose_control_response());
     assert_eq!(pipeline.calculator_total(), 0);
     let request_ids = result
         .conversation()
@@ -300,6 +319,35 @@ async fn execution_recovers_from_timeout_cancellation_and_filtered_output() -> R
         .flat_map(Message::get_tool_response_ids)
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(response_ids, request_ids);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_approval_cannot_execute_on_a_later_resume() -> Result<()> {
+    let (pipeline, api) = test_pipeline().await?;
+    let pipeline = pipeline.with_goose_mode(GooseMode::Approve).await;
+
+    api.on("approve then cancel")
+        .calls([("cancelled-approval", ADD, value(10))]);
+    pipeline.run(["approve then cancel"]).await?;
+    pipeline
+        .confirm("cancelled-approval", Permission::AllowOnce)
+        .await?;
+
+    let cancelled = pipeline.resume_cancelled().await?;
+    cancelled.assert_message(-1, ToolResponse, CANCELLED_RESPONSE);
+    assert!(cancelled.events.iter().any(|event| {
+        matches!(event, crate::agents::AgentEvent::Message(message)
+            if serde_json::to_string(message)
+                .is_ok_and(|json| json.contains(CANCELLED_RESPONSE)))
+    }));
+    assert_eq!(pipeline.calculator_total(), 0);
+
+    api.on(CANCELLED_RESPONSE).reply("approval was cancelled");
+    let resumed = pipeline.resume().await?;
+    resumed.assert_message(-1, Agent, "approval was cancelled");
+    assert_eq!(pipeline.calculator_total(), 0);
 
     Ok(())
 }
@@ -361,6 +409,30 @@ async fn tool_availability_tracks_mode_and_extension_removal() -> Result<()> {
     let result = pipeline.run(["try the tool"]).await?;
     result.assert_message(-2, ToolResponse, "chat mode");
     result.assert_message(-1, Agent, "here is the plan");
+    let skipped = result
+        .conversation()
+        .messages()
+        .iter()
+        .flat_map(|message| &message.content)
+        .find_map(|content| match content {
+            MessageContent::ToolResponse(response)
+                if response.tool_result.as_ref().is_ok_and(|result| {
+                    result.content.iter().any(|content| {
+                        matches!(content, rmcp::model::ContentBlock::Text(text)
+                            if text.text == CHAT_MODE_TOOL_SKIPPED_RESPONSE)
+                    })
+                }) =>
+            {
+                Some(response)
+            }
+            _ => None,
+        })
+        .expect("chat-mode skip has a tool response");
+    assert_eq!(
+        skipped.provenance,
+        ToolResponseProvenance::GooseSkippedInChatMode
+    );
+    assert!(skipped.is_canonical_goose_control_response());
     assert!(api.calls().last().unwrap().advertises_tool(ADD));
     assert_eq!(pipeline.calculator_total(), 0);
 

@@ -1554,6 +1554,12 @@ impl SummonClient {
         recipe: &Recipe,
         session: &crate::session::Session,
     ) -> Result<TaskConfig, anyhow::Error> {
+        if self.parent_provider_blocks_subagent_delegation().await {
+            anyhow::bail!(
+                "Delegated tasks are unavailable because the parent provider blocks subagent delegation"
+            );
+        }
+
         let mut extensions = EnabledExtensionsState::extensions_or_default(
             Some(&session.extension_data),
             Config::global(),
@@ -1730,6 +1736,25 @@ impl SummonClient {
             }
         };
         Ok((provider, model_config))
+    }
+
+    async fn parent_provider_blocks_subagent_delegation(&self) -> bool {
+        let Some(extension_manager) = self
+            .context
+            .extension_manager
+            .as_ref()
+            .and_then(|weak| weak.upgrade())
+        else {
+            return false;
+        };
+
+        let blocks_delegation = extension_manager
+            .get_provider()
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|provider| provider.blocks_subagent_delegation());
+        blocks_delegation
     }
 
     fn resolve_max_turns(&self, session: &crate::session::Session) -> usize {
@@ -2670,6 +2695,120 @@ You review code."#;
             sub_recipes: None,
             retry: None,
         }
+    }
+
+    struct DelegationBlockingTestProvider;
+
+    #[async_trait]
+    impl crate::providers::base::Provider for DelegationBlockingTestProvider {
+        fn get_name(&self) -> &str {
+            "context-managed-test"
+        }
+
+        fn manages_own_context(&self) -> bool {
+            true
+        }
+
+        fn blocks_subagent_delegation(&self) -> bool {
+            true
+        }
+
+        async fn stream(
+            &self,
+            _model_config: &goose_providers::model::ModelConfig,
+            _system: &str,
+            _messages: &[crate::conversation::message::Message],
+            _tools: &[Tool],
+        ) -> std::result::Result<
+            crate::providers::base::MessageStream,
+            goose_providers::errors::ProviderError,
+        > {
+            unreachable!("the guarded parent must reject delegation before provider use")
+        }
+    }
+
+    struct ContextManagedDelegationAllowedTestProvider;
+
+    #[async_trait]
+    impl crate::providers::base::Provider for ContextManagedDelegationAllowedTestProvider {
+        fn get_name(&self) -> &str {
+            "context-managed-delegation-allowed-test"
+        }
+
+        fn manages_own_context(&self) -> bool {
+            true
+        }
+
+        async fn stream(
+            &self,
+            _model_config: &goose_providers::model::ModelConfig,
+            _system: &str,
+            _messages: &[crate::conversation::message::Message],
+            _tools: &[Tool],
+        ) -> std::result::Result<
+            crate::providers::base::MessageStream,
+            goose_providers::errors::ProviderError,
+        > {
+            unreachable!("this test only checks the delegation policy capability")
+        }
+    }
+
+    #[tokio::test]
+    async fn test_build_task_config_rejects_blocking_parent_with_provider_override() {
+        let temp_dir = TempDir::new().unwrap();
+        let parent_provider: Arc<dyn crate::providers::base::Provider> =
+            Arc::new(DelegationBlockingTestProvider);
+        let extension_manager = Arc::new(
+            crate::agents::extension_manager::ExtensionManager::new_without_provider(
+                temp_dir.path().to_path_buf(),
+            ),
+        );
+        *extension_manager.get_provider().lock().await = Some(parent_provider);
+        let mut context = extension_manager.get_context().clone();
+        context.extension_manager = Some(Arc::downgrade(&extension_manager));
+        let client = SummonClient::new(context).unwrap();
+        let session = crate::session::Session {
+            provider_name: Some("context-managed-test".to_string()),
+            model_config: Some(goose_providers::model::ModelConfig::new("test-model")),
+            working_dir: temp_dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let params = DelegateParams {
+            provider: Some("openai".to_string()),
+            model: Some("test-model".to_string()),
+            ..Default::default()
+        };
+
+        let error = match client
+            .build_task_config(&params, &empty_recipe(), &session)
+            .await
+        {
+            Ok(_) => panic!("delegation should be rejected for a context-managed parent"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "Delegated tasks are unavailable because the parent provider blocks subagent delegation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_context_managed_parent_does_not_block_delegation_by_default() {
+        let temp_dir = TempDir::new().unwrap();
+        let parent_provider: Arc<dyn crate::providers::base::Provider> =
+            Arc::new(ContextManagedDelegationAllowedTestProvider);
+        let extension_manager = Arc::new(
+            crate::agents::extension_manager::ExtensionManager::new_without_provider(
+                temp_dir.path().to_path_buf(),
+            ),
+        );
+        *extension_manager.get_provider().lock().await = Some(parent_provider);
+        let mut context = extension_manager.get_context().clone();
+        context.extension_manager = Some(Arc::downgrade(&extension_manager));
+        let client = SummonClient::new(context).unwrap();
+
+        assert!(!client.parent_provider_blocks_subagent_delegation().await);
     }
 
     #[tokio::test]

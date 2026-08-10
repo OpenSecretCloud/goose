@@ -74,6 +74,9 @@ pub async fn compact_messages(
     conversation: &Conversation,
     manual_compact: bool,
 ) -> Result<CompactionResult> {
+    if provider.manages_own_context() {
+        anyhow::bail!("Provider-managed context cannot be compacted by goose");
+    }
     info!("Performing message compaction");
 
     let messages = conversation.messages();
@@ -451,6 +454,9 @@ pub async fn summarize_tool_call(
     conversation: &Conversation,
     tool_id: &str,
 ) -> Result<Message> {
+    if provider.manages_own_context() {
+        anyhow::bail!("Provider-managed context cannot be summarized by goose");
+    }
     let matching_messages = agent_visible_tool_pair(conversation, tool_id)?;
 
     let formatted = matching_messages
@@ -566,6 +572,7 @@ mod tests {
         message: Message,
         config: ModelConfig,
         max_tool_responses: Option<usize>,
+        manages_own_context: bool,
         captured_system: std::sync::Mutex<Option<String>>,
     }
 
@@ -585,6 +592,7 @@ mod tests {
                     request_headers: None,
                 },
                 max_tool_responses: None,
+                manages_own_context: false,
                 captured_system: std::sync::Mutex::new(None),
             }
         }
@@ -593,12 +601,21 @@ mod tests {
             self.max_tool_responses = Some(max);
             self
         }
+
+        fn with_managed_context(mut self) -> Self {
+            self.manages_own_context = true;
+            self
+        }
     }
 
     #[async_trait]
     impl Provider for MockProvider {
         fn get_name(&self) -> &str {
             "mock"
+        }
+
+        fn manages_own_context(&self) -> bool {
+            self.manages_own_context
         }
 
         async fn stream(
@@ -639,6 +656,39 @@ mod tests {
         ) -> Result<usize, ProviderError> {
             Ok(self.config.context_limit())
         }
+    }
+
+    #[tokio::test]
+    async fn provider_managed_context_refuses_host_compaction_before_inference() {
+        let provider = MockProvider::new(Message::assistant().with_text("summary"), 1_000)
+            .with_managed_context();
+        let conversation = Conversation::new_unvalidated(vec![
+            Message::user().with_text("request"),
+            Message::user().with_tool_response(
+                "tool_0",
+                Ok(rmcp::model::CallToolResult::success(vec![
+                    ContentBlock::text("private tool output"),
+                ])),
+            ),
+        ]);
+
+        let error = match compact_messages(
+            &provider,
+            &provider.config,
+            "test-session-id",
+            &conversation,
+            true,
+        )
+        .await
+        {
+            Ok(_) => panic!("provider-managed context must not be flattened by goose"),
+            Err(error) => error,
+        };
+
+        assert!(error
+            .to_string()
+            .contains("Provider-managed context cannot be compacted"));
+        assert!(provider.captured_system.lock().unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1107,6 +1157,37 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("No agent-visible tool pair"));
+    }
+
+    #[tokio::test]
+    async fn provider_managed_context_refuses_tool_pair_summary_before_inference() {
+        let provider = MockProvider::new(Message::assistant().with_text("summary"), 1_000)
+            .with_managed_context();
+        let conversation = Conversation::new_unvalidated([
+            Message::assistant()
+                .with_tool_request("tool_0", Ok(CallToolRequestParams::new("read_file"))),
+            Message::user().with_tool_response(
+                "tool_0",
+                Ok(rmcp::model::CallToolResult::success(vec![
+                    ContentBlock::text("private tool output"),
+                ])),
+            ),
+        ]);
+
+        let error = summarize_tool_call(
+            &provider,
+            &provider.config,
+            "test-session-id",
+            &conversation,
+            "tool_0",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("Provider-managed context cannot be summarized"));
+        assert!(provider.captured_system.lock().unwrap().is_none());
     }
 
     #[tokio::test]

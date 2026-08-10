@@ -11,7 +11,9 @@ use crate::agents::state_machine::operation::{
 };
 use crate::config::permission::PermissionLevel;
 use crate::config::GooseMode;
-use crate::conversation::message::{ActionRequiredData, Message, MessageContent, ToolRequest};
+use crate::conversation::message::{
+    ActionRequiredData, Message, MessageContent, ToolRequest, ToolResponseProvenance,
+};
 use crate::conversation::Conversation;
 use crate::permission::Permission;
 use crate::session::Session;
@@ -51,7 +53,11 @@ impl Operation for ToolApprovalOperation<'_> {
         conversation: &Conversation,
         emit: &Emitter,
     ) -> Result<OperationResult> {
-        let goose_mode = *self.goose_mode.lock().await;
+        let goose_mode = tokio::select! {
+            biased;
+            _ = emit.cancelled() => return not_applicable(),
+            goose_mode = self.goose_mode.lock() => *goose_mode,
+        };
         if goose_mode == GooseMode::Chat {
             return not_applicable();
         }
@@ -65,13 +71,23 @@ impl Operation for ToolApprovalOperation<'_> {
             if let Some(tool_name) = pending.tool_name {
                 if pending.permission == Permission::AlwaysAllow && pending.executable != Some(true)
                 {
-                    self.tool_inspection_manager
-                        .update_permission_manager(&tool_name, PermissionLevel::AlwaysAllow)
-                        .await;
+                    tokio::select! {
+                        biased;
+                        _ = emit.cancelled() => return not_applicable(),
+                        _ = self.tool_inspection_manager.update_permission_manager(
+                            &tool_name,
+                            PermissionLevel::AlwaysAllow,
+                        ) => {}
+                    }
                 } else if pending.permission == Permission::AlwaysDeny {
-                    self.tool_inspection_manager
-                        .update_permission_manager(&tool_name, PermissionLevel::NeverAllow)
-                        .await;
+                    tokio::select! {
+                        biased;
+                        _ = emit.cancelled() => return not_applicable(),
+                        _ = self.tool_inspection_manager.update_permission_manager(
+                            &tool_name,
+                            PermissionLevel::NeverAllow,
+                        ) => {}
+                    }
                 }
             }
 
@@ -150,6 +166,36 @@ impl Operation for ToolApprovalOperation<'_> {
             not_applicable()
         } else {
             applied(effects)
+        }
+    }
+
+    async fn cancel(
+        &self,
+        _session: &Session,
+        conversation: &Conversation,
+        _result: OperationResult,
+        emit: &Emitter,
+    ) -> Result<OperationResult> {
+        let state = ApprovalState::from_messages(messages_since_kickoff(conversation)?);
+        let mut response = Message::user();
+
+        for request in state
+            .tool_requests
+            .iter()
+            .filter(|request| !state.answered.contains(&request.id))
+        {
+            response.add_goose_control_tool_response_with_metadata(
+                request.id.clone(),
+                ToolResponseProvenance::GooseCancelledBeforeExecution,
+                request.metadata.as_ref(),
+            );
+        }
+
+        if response.is_tool_response() {
+            let response = emit.message(response).await;
+            applied([response.into()])
+        } else {
+            not_applicable()
         }
     }
 }

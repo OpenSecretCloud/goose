@@ -708,9 +708,15 @@ impl McpClient {
                     .service()
                     .register_active_tool_call(session_id, tool_call_request_id)
             });
-            let handle = client
-                .send_cancellable_request(request, PeerRequestOptions::no_options())
-                .await?;
+            let send = client.send_cancellable_request(request, PeerRequestOptions::no_options());
+            tokio::pin!(send);
+            let handle = tokio::select! {
+                biased;
+                _ = cancel_token.cancelled() => {
+                    return Err(ServiceError::Cancelled { reason: None });
+                }
+                result = &mut send => result?,
+            };
             (handle, guard)
         };
 

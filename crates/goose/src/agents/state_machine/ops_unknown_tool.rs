@@ -37,40 +37,50 @@ impl Operation for UnknownToolOperation {
 
         let mut response = Message::user();
         for (request, disposition) in pending {
-            let tool_name = request
-                .tool_call
-                .as_ref()
-                .map(|tool_call| tool_call.name.as_ref())
-                .unwrap_or("unknown");
-            let span = tool_span(tool_name, &request.id, &session.id);
-            span.record("error.type", "tool_not_available");
             let (result, unclaimed) = match disposition {
+                ToolDisposition::Decline(provenance) => {
+                    response.add_goose_control_tool_response_with_metadata(
+                        request.id,
+                        provenance,
+                        request.metadata.as_ref(),
+                    );
+                    continue;
+                }
                 ToolDisposition::ParseError(error) => (
                     Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                         "The tool call could not be parsed: {error}. Correct the arguments and try again."
                     ))])),
                     false,
                 ),
-                ToolDisposition::Execute | ToolDisposition::Decline => request
-                    .tool_call
-                    .as_ref()
-                    .map(|tool_call| {
-                        (
-                            Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                                "Tool '{}' is not available.",
-                                tool_call.name
-                            ))])),
-                            true,
-                        )
-                    })
-                    .unwrap_or_else(|error| {
-                        (
-                            Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                                "The tool call could not be parsed: {error}."
-                            ))])),
-                            false,
-                        )
-                    }),
+                ToolDisposition::Execute => {
+                    let tool_name = request
+                        .tool_call
+                        .as_ref()
+                        .map(|tool_call| tool_call.name.as_ref())
+                        .unwrap_or("unknown");
+                    let span = tool_span(tool_name, &request.id, &session.id);
+                    span.record("error.type", "tool_not_available");
+                    request
+                        .tool_call
+                        .as_ref()
+                        .map(|tool_call| {
+                            (
+                                Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                                    "Tool '{}' is not available.",
+                                    tool_call.name
+                                ))])),
+                                true,
+                            )
+                        })
+                        .unwrap_or_else(|error| {
+                            (
+                                Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                                    "The tool call could not be parsed: {error}."
+                                ))])),
+                                false,
+                            )
+                        })
+                }
             };
             let mut metadata = request.metadata.clone();
             if unclaimed {

@@ -13,10 +13,7 @@ use super::final_output_tool::FinalOutputTool;
 use super::gen_ai_telemetry;
 use super::mcp_client::GooseMcpHostInfo;
 use super::tool_confirmation_router::ToolConfirmationRouter;
-use super::tool_execution::{
-    tool_stream, ToolCallResult, ToolStream, ToolStreamItem, CHAT_MODE_TOOL_SKIPPED_RESPONSE,
-    DECLINED_RESPONSE,
-};
+use super::tool_execution::{tool_stream, ToolCallResult, ToolStream, ToolStreamItem};
 use crate::action_required_manager::ElicitationOutcome;
 use crate::agents::extension::{ExtensionConfig, ExtensionResult, ToolInfo};
 use crate::agents::extension_manager::{
@@ -43,9 +40,11 @@ use crate::config::{get_enabled_extensions, Config, GooseMode};
 use crate::context_mgmt::{
     check_if_compaction_needed, compact_messages, DEFAULT_COMPACTION_THRESHOLD,
 };
+#[cfg(test)]
+use crate::conversation::message::INTERRUPTED_RESPONSE;
 use crate::conversation::message::{
     ActionRequiredData, InferenceMetadata, Message, MessageContent, MessageUsage, ProviderMetadata,
-    SystemNotificationType, ToolRequest,
+    SystemNotificationType, ToolRequest, ToolResponseProvenance,
 };
 use crate::conversation::{
     debug_conversation_fix, fix_conversation, merge_consecutive_messages_for_request, Conversation,
@@ -69,8 +68,10 @@ use goose_providers::conversation::token_usage::{ProviderUsage, Usage};
 use goose_providers::errors::ProviderError;
 use goose_providers::thinking::ThinkingEffort;
 use regex::Regex;
+#[cfg(test)]
+use rmcp::model::ContentBlock;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ContentBlock, ElicitationAction, ErrorCode, ErrorData,
+    CallToolRequestParams, CallToolResult, ElicitationAction, ErrorCode, ErrorData,
     GetPromptResult, Prompt, ServerNotification, Tool,
 };
 use serde_json::Value;
@@ -85,6 +86,38 @@ const MAX_EMPTY_TURN_RETRIES: u32 = 3;
 const EMPTY_TURN_MESSAGE: &str =
     "The model returned an empty response. Please resend your message to continue.";
 const DEFAULT_FRONTEND_INSTRUCTIONS: &str = "The following tools are provided directly by the frontend and will be executed by the frontend when called.";
+
+fn cancelled_tool_call_result(request_id: String) -> (String, Result<ToolCallResult, ErrorData>) {
+    (
+        request_id,
+        Err(ErrorData::new(
+            ErrorCode::INTERNAL_ERROR,
+            "Tool call cancelled before execution".to_string(),
+            None,
+        )),
+    )
+}
+
+fn fill_cancelled_tool_responses(
+    requests: &[ToolRequest],
+    request_to_response_map: &mut HashMap<String, Message>,
+) {
+    for request in requests {
+        let Some(response) = request_to_response_map.get_mut(&request.id) else {
+            continue;
+        };
+        let already_answered = response.content.iter().any(
+            |content| matches!(content, MessageContent::ToolResponse(tool_response) if tool_response.id == request.id),
+        );
+        if !already_answered {
+            response.add_goose_control_tool_response_with_metadata(
+                request.id.clone(),
+                ToolResponseProvenance::GooseInterruptedUnknownCompletion,
+                request.metadata.as_ref(),
+            );
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolCategory {
@@ -920,11 +953,9 @@ impl Agent {
     ) {
         for request in &permission_check_result.denied {
             if let Some(response) = request_to_response_map.get_mut(&request.id) {
-                response.add_tool_response_with_metadata(
+                response.add_goose_control_tool_response_with_metadata(
                     request.id.clone(),
-                    Ok(CallToolResult::error(vec![
-                        rmcp::model::ContentBlock::text(DECLINED_RESPONSE),
-                    ])),
+                    ToolResponseProvenance::GooseDeniedBeforeExecution,
                     request.metadata.as_ref(),
                 );
             }
@@ -1126,6 +1157,9 @@ impl Agent {
         cancellation_token: Option<CancellationToken>,
         session: &Session,
     ) -> (String, Result<ToolCallResult, ErrorData>) {
+        if is_token_cancelled(&cancellation_token) {
+            return cancelled_tool_call_result(request_id);
+        }
         let input_summary = serde_json::json!({
             "tool": tool_call.name,
             "arguments": tool_call.arguments,
@@ -1147,6 +1181,10 @@ impl Agent {
             .lock()
             .await
             .record_tool_arguments(&tool_call.arguments, &session.working_dir);
+
+        if is_token_cancelled(&cancellation_token) {
+            return cancelled_tool_call_result(request_id);
+        }
 
         if self
             .hook_manager
@@ -1181,6 +1219,10 @@ impl Agent {
             }
         }
 
+        if is_token_cancelled(&cancellation_token) {
+            return cancelled_tool_call_result(request_id);
+        }
+
         let tool_input_for_extended = tool_call
             .arguments
             .as_ref()
@@ -1191,6 +1233,10 @@ impl Agent {
             session,
         )
         .await;
+
+        if is_token_cancelled(&cancellation_token) {
+            return cancelled_tool_call_result(request_id);
+        }
 
         if tool_call.name == FINAL_OUTPUT_TOOL_NAME {
             return if let Some(final_output_tool) = self.final_output_tool.lock().await.as_mut() {
@@ -2591,9 +2637,9 @@ impl Agent {
                                             continue;
                                         }
                                         if let Some(response) = request_to_response_map.get_mut(&request.id) {
-                                            response.add_tool_response_with_metadata(
+                                            response.add_goose_control_tool_response_with_metadata(
                                                 request.id.clone(),
-                                                Ok(CallToolResult::success(vec![ContentBlock::text(CHAT_MODE_TOOL_SKIPPED_RESPONSE)])),
+                                                ToolResponseProvenance::GooseSkippedInChatMode,
                                                 request.metadata.as_ref(),
                                             );
                                         }
@@ -2673,8 +2719,10 @@ impl Agent {
 
                                         tokio::select! {
                                             biased;
-
                                             tool_item = combined.next() => {
+                                                if is_token_cancelled(&cancel_token) {
+                                                    break;
+                                                }
                                                 match tool_item {
                                                     Some((request_id, item)) => {
                                                         match item {
@@ -2724,6 +2772,13 @@ impl Agent {
 
                                             _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
                                         }
+                                    }
+
+                                    if is_token_cancelled(&cancel_token) {
+                                        fill_cancelled_tool_responses(
+                                            &remaining_requests,
+                                            &mut request_to_response_map,
+                                        );
                                     }
 
                                     if all_install_successful && !enable_extension_request_ids.is_empty() {
@@ -3979,6 +4034,43 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    #[test]
+    fn cancelled_tool_batch_answers_only_unanswered_requests() {
+        let answered = ToolRequest {
+            id: "answered".to_string(),
+            tool_call: Ok(CallToolRequestParams::new("developer__read")),
+            metadata: None,
+            tool_meta: None,
+        };
+        let unanswered = ToolRequest {
+            id: "unanswered".to_string(),
+            tool_call: Ok(CallToolRequestParams::new("developer__read")),
+            metadata: None,
+            tool_meta: None,
+        };
+        let mut answered_response = Message::user();
+        answered_response.add_tool_response_with_metadata(
+            answered.id.clone(),
+            Ok(CallToolResult::success(vec![ContentBlock::text(
+                "completed",
+            )])),
+            None,
+        );
+        let mut responses = HashMap::from([
+            (answered.id.clone(), answered_response),
+            (unanswered.id.clone(), Message::user()),
+        ]);
+
+        fill_cancelled_tool_responses(&[answered.clone(), unanswered.clone()], &mut responses);
+
+        let answered_json = serde_json::to_string(responses.get(&answered.id).unwrap()).unwrap();
+        assert!(answered_json.contains("completed"));
+        assert!(!answered_json.contains(INTERRUPTED_RESPONSE));
+        let unanswered_json =
+            serde_json::to_string(responses.get(&unanswered.id).unwrap()).unwrap();
+        assert!(unanswered_json.contains(INTERRUPTED_RESPONSE));
+    }
 
     #[test]
     fn provider_session_id_comes_from_latest_inference() {

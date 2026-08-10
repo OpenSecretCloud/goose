@@ -5,16 +5,21 @@ use rmcp::model::CallToolResult;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use std::path::PathBuf;
 
 use crate::config::permission::PermissionLevel;
-use crate::conversation::message::Message;
+use crate::conversation::message::{Message, ToolResponseProvenance};
+#[cfg(test)]
+pub(crate) use crate::conversation::message::{
+    CANCELLED_RESPONSE, CHAT_MODE_TOOL_SKIPPED_RESPONSE, DECLINED_RESPONSE,
+};
 use crate::mcp_utils::ToolResult;
-use crate::permission::Permission;
-use rmcp::model::{ContentBlock, ServerNotification};
+use crate::permission::permission_confirmation::PrincipalType;
+use crate::permission::{Permission, PermissionConfirmation};
+use rmcp::model::ServerNotification;
 
 #[derive(Clone)]
 pub(crate) struct ToolCallNotificationEmitter {
@@ -132,18 +137,43 @@ where
     })
 }
 
-pub const DECLINED_RESPONSE: &str = "The user has declined to run this tool. \
-    DO NOT attempt to call this tool again. \
-    If there are no alternative methods to proceed, clearly explain the situation and STOP.";
+struct ConfirmationOutcome {
+    confirmation: PermissionConfirmation,
+    cancelled_by_token: bool,
+}
 
-pub const CHAT_MODE_TOOL_SKIPPED_RESPONSE: &str = "Let the user know the tool call was skipped in goose chat mode. \
-                                        DO NOT apologize for skipping the tool call. DO NOT say sorry. \
-                                        Provide an explanation of what the tool call would do, structured as a \
-                                        plan for the user. Again, DO NOT apologize. \
-                                        **Example Plan:**\n \
-                                        1. **Identify Task Scope** - Determine the purpose and expected outcome.\n \
-                                        2. **Outline Steps** - Break down the steps.\n \
-                                        If needed, adjust the explanation based on user preferences or questions.";
+async fn await_confirmation_or_cancel(
+    request_id: &str,
+    confirmation_rx: oneshot::Receiver<PermissionConfirmation>,
+    cancellation_token: Option<&CancellationToken>,
+) -> anyhow::Result<ConfirmationOutcome> {
+    let receive = async {
+        confirmation_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("Confirmation channel closed for request {}", request_id))
+    };
+    if let Some(cancellation_token) = cancellation_token {
+        tokio::select! {
+            biased;
+            _ = cancellation_token.cancelled() => Ok(ConfirmationOutcome {
+                confirmation: PermissionConfirmation {
+                    principal_type: PrincipalType::Tool,
+                    permission: Permission::Cancel,
+                },
+                cancelled_by_token: true,
+            }),
+            confirmation = receive => confirmation.map(|confirmation| ConfirmationOutcome {
+                confirmation,
+                cancelled_by_token: false,
+            }),
+        }
+    } else {
+        receive.await.map(|confirmation| ConfirmationOutcome {
+            confirmation,
+            cancelled_by_token: false,
+        })
+    }
+}
 
 impl Agent {
     pub(super) fn handle_approval_tool_requests<'a>(
@@ -158,6 +188,20 @@ impl Agent {
         try_stream! {
         for request in tool_requests.iter() {
             if let Ok(tool_call) = request.tool_call.clone() {
+                if cancellation_token
+                    .as_ref()
+                    .is_some_and(CancellationToken::is_cancelled)
+                {
+                    if let Some(response) = request_to_response_map.get_mut(&request.id) {
+                        response.add_goose_control_tool_response_with_metadata(
+                            request.id.clone(),
+                            ToolResponseProvenance::GooseCancelledBeforeExecution,
+                            request.metadata.as_ref(),
+                        );
+                    }
+                    continue;
+                }
+
                 let security_message = inspection_results.iter()
                     .find(|result| result.tool_request_id == request.id)
                     .and_then(|result| {
@@ -180,26 +224,41 @@ impl Agent {
                     .user_only();
                 yield action_required_msg;
 
-                let confirmation = confirmation_rx.await
-                    .map_err(|_| anyhow::anyhow!("Confirmation channel closed for request {}", request.id))?;
+                let confirmation_outcome = await_confirmation_or_cancel(
+                    &request.id,
+                    confirmation_rx,
+                    cancellation_token.as_ref(),
+                )
+                .await?;
+                let confirmation = confirmation_outcome.confirmation;
 
-                if let Some(finding_id) = get_security_finding_id_from_results(&request.id, inspection_results) {
-                    let action = match confirmation.permission {
-                        Permission::AllowOnce | Permission::AlwaysAllow => "ALLOW",
-                        _ => "BLOCK",
-                    };
-                    tracing::info!(
-                        monotonic_counter.goose.prompt_injection_user_decisions = 1,
-                        security.event_type = "user_decision",
-                        security.action = action,
-                        security.finding_id = %finding_id,
-                        tool.request_id = %request.id,
-                        user.decision = ?confirmation.permission,
-                        "security finding: user decision"
-                    );
+                if !confirmation_outcome.cancelled_by_token {
+                    if let Some(finding_id) =
+                        get_security_finding_id_from_results(&request.id, inspection_results)
+                    {
+                        let action = match confirmation.permission {
+                            Permission::AllowOnce | Permission::AlwaysAllow => "ALLOW",
+                            _ => "BLOCK",
+                        };
+                        tracing::info!(
+                            monotonic_counter.goose.prompt_injection_user_decisions = 1,
+                            security.event_type = "user_decision",
+                            security.action = action,
+                            security.finding_id = %finding_id,
+                            tool.request_id = %request.id,
+                            user.decision = ?confirmation.permission,
+                            "security finding: user decision"
+                        );
+                    }
                 }
 
-                if confirmation.permission == Permission::AllowOnce || confirmation.permission == Permission::AlwaysAllow {
+                let cancelled = cancellation_token
+                    .as_ref()
+                    .is_some_and(CancellationToken::is_cancelled);
+                if !cancelled
+                    && (confirmation.permission == Permission::AllowOnce
+                        || confirmation.permission == Permission::AlwaysAllow)
+                {
                     let (req_id, tool_result) = self.dispatch_tool_call(tool_call.clone(), request.id.clone(), cancellation_token.clone(), session).await;
 
                     tool_futures.push((req_id, match tool_result {
@@ -222,9 +281,16 @@ impl Agent {
                     }
                 } else {
                     if let Some(response) = request_to_response_map.get_mut(&request.id) {
-                        response.add_tool_response_with_metadata(
+                        let provenance = if cancelled
+                            || confirmation.permission == Permission::Cancel
+                        {
+                            ToolResponseProvenance::GooseCancelledBeforeExecution
+                        } else {
+                            ToolResponseProvenance::GooseDeniedBeforeExecution
+                        };
+                        response.add_goose_control_tool_response_with_metadata(
                             request.id.clone(),
-                            Ok(CallToolResult::error(vec![ContentBlock::text(DECLINED_RESPONSE)])),
+                            provenance,
                             request.metadata.as_ref(),
                         );
                     }
@@ -264,5 +330,312 @@ impl Agent {
             }
         }
         .boxed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn allow_once() -> PermissionConfirmation {
+        PermissionConfirmation {
+            principal_type: PrincipalType::Tool,
+            permission: Permission::AllowOnce,
+        }
+    }
+
+    fn deny_once() -> PermissionConfirmation {
+        PermissionConfirmation {
+            principal_type: PrincipalType::Tool,
+            permission: Permission::DenyOnce,
+        }
+    }
+
+    fn cancel_once() -> PermissionConfirmation {
+        PermissionConfirmation {
+            principal_type: PrincipalType::Tool,
+            permission: Permission::Cancel,
+        }
+    }
+
+    #[tokio::test]
+    async fn denied_approval_records_a_canonical_goose_control_response() {
+        let agent = Agent::new();
+        let request = ToolRequest {
+            id: "request".to_string(),
+            tool_call: Ok(rmcp::model::CallToolRequestParams::new(
+                "missing_extension__tool".to_string(),
+            )),
+            metadata: None,
+            tool_meta: None,
+        };
+        let mut tool_futures = Vec::new();
+        let mut responses =
+            HashMap::from([(request.id.clone(), Message::user().with_generated_id())]);
+        let session = Session {
+            id: "session".to_string(),
+            ..Session::default()
+        };
+        let inspection_results = Vec::new();
+        let mut approval_stream = agent.handle_approval_tool_requests(
+            std::slice::from_ref(&request),
+            &mut tool_futures,
+            &mut responses,
+            Some(CancellationToken::new()),
+            &session,
+            &inspection_results,
+        );
+
+        approval_stream
+            .next()
+            .await
+            .expect("approval stream should request confirmation")
+            .expect("approval request should be valid");
+        assert!(
+            agent
+                .tool_confirmation_router
+                .deliver(request.id.clone(), deny_once())
+                .await
+        );
+        assert!(approval_stream.next().await.is_none());
+        drop(approval_stream);
+
+        assert!(tool_futures.is_empty());
+        let response = responses.get(&request.id).unwrap();
+        let control = response.content.iter().find_map(|content| match content {
+            crate::conversation::message::MessageContent::ToolResponse(response) => Some(response),
+            _ => None,
+        });
+        let control = control.expect("denial should create a tool response");
+        assert_eq!(
+            control.provenance,
+            ToolResponseProvenance::GooseDeniedBeforeExecution
+        );
+        assert!(control.is_canonical_goose_control_response());
+    }
+
+    #[tokio::test]
+    async fn explicit_cancel_records_a_canonical_goose_cancellation_response() {
+        let agent = Agent::new();
+        let request = ToolRequest {
+            id: "request".to_string(),
+            tool_call: Ok(rmcp::model::CallToolRequestParams::new(
+                "missing_extension__tool".to_string(),
+            )),
+            metadata: None,
+            tool_meta: None,
+        };
+        let mut tool_futures = Vec::new();
+        let mut responses =
+            HashMap::from([(request.id.clone(), Message::user().with_generated_id())]);
+        let session = Session {
+            id: "session".to_string(),
+            ..Session::default()
+        };
+        let mut approval_stream = agent.handle_approval_tool_requests(
+            std::slice::from_ref(&request),
+            &mut tool_futures,
+            &mut responses,
+            Some(CancellationToken::new()),
+            &session,
+            &[],
+        );
+
+        approval_stream
+            .next()
+            .await
+            .expect("approval stream should request confirmation")
+            .expect("approval request should be valid");
+        assert!(
+            agent
+                .tool_confirmation_router
+                .deliver(request.id.clone(), cancel_once())
+                .await
+        );
+        assert!(approval_stream.next().await.is_none());
+        drop(approval_stream);
+
+        assert!(tool_futures.is_empty());
+        let control = responses[&request.id]
+            .content
+            .iter()
+            .find_map(|content| match content {
+                crate::conversation::message::MessageContent::ToolResponse(response) => {
+                    Some(response)
+                }
+                _ => None,
+            })
+            .expect("cancellation should create a tool response");
+        assert_eq!(
+            control.provenance,
+            ToolResponseProvenance::GooseCancelledBeforeExecution
+        );
+        assert!(control.is_canonical_goose_control_response());
+    }
+
+    #[tokio::test]
+    async fn queued_allow_once_loses_to_already_cancelled_run() {
+        let (sender, receiver) = oneshot::channel();
+        sender.send(allow_once()).unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let outcome = await_confirmation_or_cancel("request", receiver, Some(&cancellation))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.confirmation.permission, Permission::Cancel);
+        assert!(outcome.cancelled_by_token);
+    }
+
+    #[tokio::test]
+    async fn uncancelled_run_receives_queued_allow_once() {
+        let (sender, receiver) = oneshot::channel();
+        sender.send(allow_once()).unwrap();
+        let cancellation = CancellationToken::new();
+
+        let outcome = await_confirmation_or_cancel("request", receiver, Some(&cancellation))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.confirmation.permission, Permission::AllowOnce);
+        assert!(!outcome.cancelled_by_token);
+    }
+
+    #[tokio::test]
+    async fn cancelled_queued_approval_never_creates_a_tool_future() {
+        let agent = Agent::new();
+        let request = ToolRequest {
+            id: "request".to_string(),
+            tool_call: Ok(rmcp::model::CallToolRequestParams::new(
+                "missing_extension__tool".to_string(),
+            )),
+            metadata: None,
+            tool_meta: None,
+        };
+        let second_request = ToolRequest {
+            id: "second-request".to_string(),
+            tool_call: Ok(rmcp::model::CallToolRequestParams::new(
+                "missing_extension__second_tool".to_string(),
+            )),
+            metadata: None,
+            tool_meta: None,
+        };
+        let mut tool_futures = Vec::new();
+        let mut responses = HashMap::from([
+            (request.id.clone(), Message::user().with_generated_id()),
+            (
+                second_request.id.clone(),
+                Message::user().with_generated_id(),
+            ),
+        ]);
+        let cancellation = CancellationToken::new();
+        let session = Session {
+            id: "session".to_string(),
+            ..Session::default()
+        };
+        let inspection_results = Vec::new();
+        let requests = [request.clone(), second_request.clone()];
+        let mut approval_stream = agent.handle_approval_tool_requests(
+            &requests,
+            &mut tool_futures,
+            &mut responses,
+            Some(cancellation.clone()),
+            &session,
+            &inspection_results,
+        );
+
+        let action_required = approval_stream
+            .next()
+            .await
+            .expect("approval stream should request confirmation")
+            .expect("approval request should be valid");
+        assert!(action_required.content.iter().any(|content| matches!(
+            content,
+            crate::conversation::message::MessageContent::ActionRequired(_)
+        )));
+
+        assert!(
+            agent
+                .tool_confirmation_router
+                .deliver(request.id.clone(), allow_once())
+                .await
+        );
+        cancellation.cancel();
+
+        assert!(approval_stream.next().await.is_none());
+        drop(approval_stream);
+        assert!(
+            tool_futures.is_empty(),
+            "a cancelled queued approval must not reach tool dispatch"
+        );
+        let response = serde_json::to_string(responses.get("request").unwrap()).unwrap();
+        assert!(response.contains(CANCELLED_RESPONSE));
+        assert!(!response.contains(DECLINED_RESPONSE));
+        assert!(response.contains("goose_cancelled_before_execution"));
+        let second_response =
+            serde_json::to_string(responses.get("second-request").unwrap()).unwrap();
+        assert!(second_response.contains(CANCELLED_RESPONSE));
+        assert!(!second_response.contains(DECLINED_RESPONSE));
+        assert!(second_response.contains("goose_cancelled_before_execution"));
+        assert!(
+            !agent
+                .tool_confirmation_router
+                .deliver(second_request.id, allow_once())
+                .await,
+            "cancellation must not register a second confirmation"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_rejects_a_late_allow_once() {
+        let agent = Agent::new();
+        let request = ToolRequest {
+            id: "request".to_string(),
+            tool_call: Ok(rmcp::model::CallToolRequestParams::new(
+                "missing_extension__tool".to_string(),
+            )),
+            metadata: None,
+            tool_meta: None,
+        };
+        let mut tool_futures = Vec::new();
+        let mut responses =
+            HashMap::from([(request.id.clone(), Message::user().with_generated_id())]);
+        let cancellation = CancellationToken::new();
+        let session = Session {
+            id: "session".to_string(),
+            ..Session::default()
+        };
+        let inspection_results = Vec::new();
+        let mut approval_stream = agent.handle_approval_tool_requests(
+            std::slice::from_ref(&request),
+            &mut tool_futures,
+            &mut responses,
+            Some(cancellation.clone()),
+            &session,
+            &inspection_results,
+        );
+
+        approval_stream
+            .next()
+            .await
+            .expect("approval stream should request confirmation")
+            .expect("approval request should be valid");
+        cancellation.cancel();
+        assert!(approval_stream.next().await.is_none());
+        drop(approval_stream);
+
+        assert!(tool_futures.is_empty());
+        assert!(
+            !agent
+                .tool_confirmation_router
+                .deliver(request.id.clone(), allow_once())
+                .await,
+            "a late approval must not revive a cancelled request"
+        );
+        let response = serde_json::to_string(responses.get(&request.id).unwrap()).unwrap();
+        assert!(response.contains(CANCELLED_RESPONSE));
+        assert!(!response.contains(DECLINED_RESPONSE));
+        assert!(response.contains("goose_cancelled_before_execution"));
     }
 }

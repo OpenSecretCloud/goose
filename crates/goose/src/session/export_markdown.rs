@@ -691,6 +691,7 @@ mod tests {
         let text_content = TextContent::new("Command executed successfully".to_string());
         let tool_response = ToolResponse {
             metadata: None,
+            provenance: Default::default(),
             id: "test-id".to_string(),
             tool_result: Ok(rmcp::model::CallToolResult::success(vec![
                 ContentBlock::text(text_content.text),
@@ -708,6 +709,7 @@ mod tests {
         let text_content = TextContent::new(json_text.to_string());
         let tool_response = ToolResponse {
             metadata: None,
+            provenance: Default::default(),
             id: "test-id".to_string(),
             tool_result: Ok(rmcp::model::CallToolResult::success(vec![
                 ContentBlock::text(text_content.text),
@@ -807,6 +809,7 @@ if __name__ == "__main__":
         let text_content = TextContent::new(python_code.to_string());
         let tool_response = ToolResponse {
             metadata: None,
+            provenance: Default::default(),
             id: "shell-cat".to_string(),
             tool_result: Ok(rmcp::model::CallToolResult::success(vec![
                 ContentBlock::text(text_content.text),
@@ -843,6 +846,7 @@ if __name__ == "__main__":
         let text_content = TextContent::new(git_output.to_string());
         let tool_response = ToolResponse {
             metadata: None,
+            provenance: Default::default(),
             id: "git-status".to_string(),
             tool_result: Ok(rmcp::model::CallToolResult::success(vec![
                 ContentBlock::text(text_content.text),
@@ -887,6 +891,7 @@ warning: unused variable `x`
         let text_content = TextContent::new(build_output.to_string());
         let tool_response = ToolResponse {
             metadata: None,
+            provenance: Default::default(),
             id: "cargo-build".to_string(),
             tool_result: Ok(rmcp::model::CallToolResult::success(vec![
                 ContentBlock::text(text_content.text),
@@ -929,6 +934,7 @@ warning: unused variable `x`
         let text_content = TextContent::new(api_response.to_string());
         let tool_response = ToolResponse {
             metadata: None,
+            provenance: Default::default(),
             id: "curl-api".to_string(),
             tool_result: Ok(rmcp::model::CallToolResult::success(vec![
                 ContentBlock::text(text_content.text),
@@ -960,6 +966,7 @@ warning: unused variable `x`
         let text_content = TextContent::new("File created successfully".to_string());
         let tool_response = ToolResponse {
             metadata: None,
+            provenance: Default::default(),
             id: "editor-write".to_string(),
             tool_result: Ok(rmcp::model::CallToolResult::success(vec![
                 ContentBlock::text(text_content.text),
@@ -998,6 +1005,7 @@ Command failed with exit code 2"#;
         let text_content = TextContent::new(error_output.to_string());
         let tool_response = ToolResponse {
             metadata: None,
+            provenance: Default::default(),
             id: "shell-error".to_string(),
             tool_result: Ok(rmcp::model::CallToolResult::success(vec![
                 ContentBlock::text(text_content.text),
@@ -1034,6 +1042,7 @@ Command failed with exit code 2"#;
         let text_content = TextContent::new(script_output.to_string());
         let tool_response = ToolResponse {
             metadata: None,
+            provenance: Default::default(),
             id: "script-exec".to_string(),
             tool_result: Ok(rmcp::model::CallToolResult::success(vec![
                 ContentBlock::text(text_content.text),
@@ -1076,6 +1085,7 @@ drwx------   3 user  staff    96 Dec  6 16:20 com.apple.launchd.abc
         let text_content = TextContent::new(multi_output.to_string());
         let tool_response = ToolResponse {
             metadata: None,
+            provenance: Default::default(),
             id: "multi-cmd".to_string(),
             tool_result: Ok(rmcp::model::CallToolResult::success(vec![
                 ContentBlock::text(text_content.text),
@@ -1114,6 +1124,7 @@ src/middleware.rs:12:async fn auth_middleware(req: Request, next: Next) -> Resul
         let text_content = TextContent::new(grep_output.to_string());
         let tool_response = ToolResponse {
             metadata: None,
+            provenance: Default::default(),
             id: "grep-search".to_string(),
             tool_result: Ok(rmcp::model::CallToolResult::success(vec![
                 ContentBlock::text(text_content.text),
@@ -1149,6 +1160,7 @@ src/middleware.rs:12:async fn auth_middleware(req: Request, next: Next) -> Resul
         let text_content = TextContent::new(json_output.to_string());
         let tool_response = ToolResponse {
             metadata: None,
+            provenance: Default::default(),
             id: "json-test".to_string(),
             tool_result: Ok(rmcp::model::CallToolResult::success(vec![
                 ContentBlock::text(text_content.text),
@@ -1185,6 +1197,7 @@ found 0 vulnerabilities"#;
         let text_content = TextContent::new(npm_output.to_string());
         let tool_response = ToolResponse {
             metadata: None,
+            provenance: Default::default(),
             id: "npm-install".to_string(),
             tool_result: Ok(rmcp::model::CallToolResult::success(vec![
                 ContentBlock::text(text_content.text),
