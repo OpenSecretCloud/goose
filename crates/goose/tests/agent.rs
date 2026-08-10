@@ -14,8 +14,11 @@ mod tests {
         use super::*;
         use async_trait::async_trait;
         use chrono::{DateTime, Utc};
-        use goose::agents::platform_tools::PLATFORM_MANAGE_SCHEDULE_TOOL_NAME;
-        use goose::agents::AgentConfig;
+        use goose::agents::platform_extensions::scheduler::{
+            EXTENSION_NAME as SCHEDULER_EXTENSION_NAME, MANAGE_SCHEDULE_TOOL_NAME_COMPLETE,
+        };
+        use goose::agents::ExtensionConfig;
+        use goose::agents::{AgentConfig, ScheduleTool};
         use goose::config::permission::PermissionManager;
         use goose::config::GooseMode;
         use goose::scheduler::{ScheduledJob, SchedulerError, ValidatedScheduleRecipe};
@@ -125,6 +128,25 @@ mod tests {
             }
         }
 
+        async fn add_scheduler_extension(agent: &Agent) {
+            agent
+                .extension_manager
+                .add_extension(
+                    ExtensionConfig::Platform {
+                        name: SCHEDULER_EXTENSION_NAME.to_string(),
+                        description: "Create and manage scheduled recipe execution".to_string(),
+                        display_name: Some("Scheduler".to_string()),
+                        bundled: Some(true),
+                        available_tools: vec![],
+                    },
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
         #[async_trait]
         impl SchedulerTrait for MockScheduler {
             async fn add_scheduled_job(
@@ -230,11 +252,12 @@ mod tests {
                 GoosePlatform::GooseCli,
             );
             let agent = Agent::with_config(config);
+            add_scheduler_extension(&agent).await;
 
             let tools = agent.list_tools("test-session-id", None).await;
             let schedule_tool = tools
                 .iter()
-                .find(|tool| tool.name == PLATFORM_MANAGE_SCHEDULE_TOOL_NAME);
+                .find(|tool| tool.name == MANAGE_SCHEDULE_TOOL_NAME_COMPLETE);
             assert!(schedule_tool.is_some());
 
             let tool = schedule_tool.unwrap();
@@ -248,16 +271,17 @@ mod tests {
         #[tokio::test]
         async fn test_no_schedule_management_tool_without_scheduler() {
             let agent = Agent::new();
+            add_scheduler_extension(&agent).await;
 
             let tools = agent.list_tools("test-session-id", None).await;
             let schedule_tool = tools
                 .iter()
-                .find(|tool| tool.name == PLATFORM_MANAGE_SCHEDULE_TOOL_NAME);
+                .find(|tool| tool.name == MANAGE_SCHEDULE_TOOL_NAME_COMPLETE);
             assert!(schedule_tool.is_none());
         }
 
         #[tokio::test]
-        async fn test_schedule_management_tool_in_platform_tools() {
+        async fn test_schedule_management_tool_in_scheduler_extension() {
             let temp_dir = TempDir::new().unwrap();
             let data_dir = temp_dir.path().to_path_buf();
             let session_manager = Arc::new(SessionManager::new(data_dir.clone()));
@@ -272,15 +296,18 @@ mod tests {
                 GoosePlatform::GooseCli,
             );
             let agent = Agent::with_config(config);
+            add_scheduler_extension(&agent).await;
 
             let tools = agent
-                .list_tools("test-session-id", Some("platform".to_string()))
+                .list_tools(
+                    "test-session-id",
+                    Some(SCHEDULER_EXTENSION_NAME.to_string()),
+                )
                 .await;
 
-            // Check that the schedule management tool is included in platform tools
             let schedule_tool = tools
                 .iter()
-                .find(|tool| tool.name == PLATFORM_MANAGE_SCHEDULE_TOOL_NAME);
+                .find(|tool| tool.name == MANAGE_SCHEDULE_TOOL_NAME_COMPLETE);
             assert!(schedule_tool.is_some());
 
             let tool = schedule_tool.unwrap();
@@ -327,11 +354,12 @@ mod tests {
                 GoosePlatform::GooseCli,
             );
             let agent = Agent::with_config(config);
+            add_scheduler_extension(&agent).await;
 
             let tools = agent.list_tools("test-session-id", None).await;
             let schedule_tool = tools
                 .iter()
-                .find(|tool| tool.name == PLATFORM_MANAGE_SCHEDULE_TOOL_NAME);
+                .find(|tool| tool.name == MANAGE_SCHEDULE_TOOL_NAME_COMPLETE);
             assert!(schedule_tool.is_some());
 
             let tool = schedule_tool.unwrap();
@@ -358,9 +386,7 @@ mod tests {
         #[tokio::test]
         async fn test_schedule_sessions_reports_message_count_without_conversation() {
             let temp_dir = TempDir::new().unwrap();
-            let data_dir = temp_dir.path().to_path_buf();
-            let session_manager = Arc::new(SessionManager::new(data_dir.clone()));
-            let permission_manager = Arc::new(PermissionManager::new(data_dir));
+            let session_manager = Arc::new(SessionManager::new(temp_dir.path().to_path_buf()));
 
             let session = Session {
                 id: "session-123".to_string(),
@@ -373,24 +399,13 @@ mod tests {
                 "session-123".to_string(),
                 session,
             )]));
-            let config = AgentConfig::new(
-                session_manager,
-                permission_manager,
-                Some(mock_scheduler),
-                GooseMode::Auto,
-                false,
-                GoosePlatform::GooseCli,
-            );
-            let agent = Agent::with_config(config);
+            let schedule_tool = ScheduleTool::new(mock_scheduler, session_manager);
 
-            let result = agent
-                .handle_schedule_management(
-                    serde_json::json!({
-                        "action": "sessions",
-                        "job_id": "daily-report"
-                    }),
-                    "test-request".to_string(),
-                )
+            let result = schedule_tool
+                .execute(serde_json::json!({
+                    "action": "sessions",
+                    "job_id": "daily-report"
+                }))
                 .await
                 .expect("schedule sessions should succeed");
 
@@ -1389,7 +1404,11 @@ mod tests {
                 .messages()
                 .to_vec();
 
-            let user_count = messages.iter().filter(|m| m.role == Role::User).count();
+            // Turn-context events are excluded; this test is about streaming deltas.
+            let user_count = messages
+                .iter()
+                .filter(|m| m.role == Role::User && m.is_user_visible())
+                .count();
             let asst_count = messages
                 .iter()
                 .filter(|m| m.role == Role::Assistant)
@@ -1438,7 +1457,10 @@ mod tests {
                 .messages()
                 .to_vec();
 
-            let user_count2 = messages2.iter().filter(|m| m.role == Role::User).count();
+            let user_count2 = messages2
+                .iter()
+                .filter(|m| m.role == Role::User && m.is_user_visible())
+                .count();
             let asst_count2 = messages2
                 .iter()
                 .filter(|m| m.role == Role::Assistant)
@@ -1650,6 +1672,7 @@ mod tests {
                 &ImageFormat::OpenAi,
                 OpenAiFormatOptions {
                     preserve_thinking_context: true,
+                    ..Default::default()
                 },
             );
             let has_reasoning_on_tool_call = spec.iter().any(|m| {
@@ -1923,7 +1946,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_reasoning_preserved_on_all_tool_calls_when_thinking_in_separate_chunk(
+        async fn test_multi_tool_response_preserves_reasoning_and_message_id_correlation(
         ) -> Result<()> {
             use goose_providers::formats::openai::{
                 format_messages_with_options, OpenAiFormatOptions,
@@ -1972,8 +1995,23 @@ mod tests {
                 )
                 .await?;
             tokio::pin!(reply_stream);
+            let mut live_tool_message_id = None;
+            let mut usage_message_ids = Vec::new();
             while let Some(event) = reply_stream.next().await {
-                event?;
+                match event? {
+                    AgentEvent::Message(message)
+                        if message
+                            .content
+                            .iter()
+                            .any(|content| matches!(content, MessageContent::ToolRequest(_))) =>
+                    {
+                        live_tool_message_id = message.id;
+                    }
+                    AgentEvent::MessageUsage { message_id, .. } => {
+                        usage_message_ids.push(message_id);
+                    }
+                    _ => {}
+                }
             }
 
             let reloaded = session_manager.get_session(&session_id, true).await?;
@@ -1983,11 +2021,51 @@ mod tests {
                 .messages()
                 .to_vec();
 
+            let live_tool_message_id =
+                live_tool_message_id.expect("live tool message must have a generated ID");
+            let persisted_tool_message_ids: Vec<&str> = messages
+                .iter()
+                .filter(|message| {
+                    message
+                        .content
+                        .iter()
+                        .any(|content| matches!(content, MessageContent::ToolRequest(_)))
+                })
+                .map(|message| {
+                    message
+                        .id
+                        .as_deref()
+                        .expect("persisted tool message must have an ID")
+                })
+                .collect();
+
+            assert_eq!(persisted_tool_message_ids.len(), 2);
+            assert_ne!(
+                persisted_tool_message_ids[0], persisted_tool_message_ids[1],
+                "split tool messages must keep distinct message IDs"
+            );
+            assert_eq!(
+                persisted_tool_message_ids
+                    .iter()
+                    .copied()
+                    .filter(|message_id| *message_id == live_tool_message_id.as_str())
+                    .count(),
+                1,
+                "exactly one persisted tool message must retain the live message ID"
+            );
+            assert!(
+                usage_message_ids.iter().any(|message_id| {
+                    message_id.as_deref() == Some(live_tool_message_id.as_str())
+                }),
+                "tool-turn usage must reference the live message ID"
+            );
+
             let spec = format_messages_with_options(
                 &messages,
                 &ImageFormat::OpenAi,
                 OpenAiFormatOptions {
                     preserve_thinking_context: true,
+                    ..Default::default()
                 },
             );
 
@@ -2494,14 +2572,63 @@ mod tests {
                 .reply(Message::user().with_text("/goal"), session_config, None)
                 .await?;
             tokio::pin!(reply_stream);
+
+            let mut emitted_user_id = None;
+            let mut emitted_response_id = None;
             while let Some(event) = reply_stream.next().await {
-                let _ = event?;
+                if let AgentEvent::Message(message) = event? {
+                    if message.role == rmcp::model::Role::User
+                        && message.as_concat_text() == "/goal"
+                    {
+                        emitted_user_id = message.id;
+                    } else if message.role == rmcp::model::Role::Assistant
+                        && message.as_concat_text().contains("No goal set")
+                    {
+                        emitted_response_id = message.id;
+                    }
+                }
             }
 
             assert_eq!(
                 provider.call_count.load(Ordering::SeqCst),
                 0,
                 "Querying the goal should not start an agent turn"
+            );
+
+            let emitted_user_id = emitted_user_id.expect("User message should be emitted with ID");
+            assert!(emitted_user_id.starts_with("msg_"));
+            let emitted_response_id =
+                emitted_response_id.expect("Slash command response should be emitted with ID");
+            assert!(emitted_response_id.starts_with("msg_"));
+
+            let reloaded = session_manager.get_session(&session.id, true).await?;
+            let conversation = reloaded
+                .conversation
+                .expect("Session should have a conversation");
+            let stored_user_message = conversation
+                .messages()
+                .iter()
+                .find(|message| {
+                    message.role == rmcp::model::Role::User && message.as_concat_text() == "/goal"
+                })
+                .expect("User message should be stored");
+
+            assert_eq!(
+                stored_user_message.id.as_deref(),
+                Some(emitted_user_id.as_str())
+            );
+            let stored_response_message = conversation
+                .messages()
+                .iter()
+                .find(|message| {
+                    message.role == rmcp::model::Role::Assistant
+                        && message.as_concat_text().contains("No goal set")
+                })
+                .expect("Slash command response should be stored");
+
+            assert_eq!(
+                stored_response_message.id.as_deref(),
+                Some(emitted_response_id.as_str())
             );
 
             Ok(())
@@ -2822,7 +2949,7 @@ mod tests {
         use goose_providers::conversation::token_usage::{ProviderUsage, Usage};
         use goose_providers::errors::ProviderError;
         use goose_providers::model::ModelConfig;
-        use goose_test_support::{IgnoreSessionId, McpFixture};
+        use goose_test_support::McpFixture;
         use rmcp::model::{CallToolRequestParams, Tool};
         use std::path::PathBuf;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2891,7 +3018,7 @@ mod tests {
         #[tokio::test]
         async fn live_tool_result_projects_user_content_but_persists_canonical_result() -> Result<()>
         {
-            let mcp = McpFixture::new(Arc::new(IgnoreSessionId)).await;
+            let mcp = McpFixture::new().await;
             let extension =
                 ExtensionConfig::streamable_http("mcp-fixture", &mcp.url, "MCP fixture", 30_u64);
             let temp_dir = tempfile::tempdir()?;
@@ -2971,7 +3098,9 @@ mod tests {
     mod empty_turn_tests {
         use super::*;
         use async_trait::async_trait;
-        use goose::agents::{AgentEvent, SessionConfig};
+        use goose::agents::final_output_tool::FINAL_OUTPUT_TOOL_NAME;
+        use goose::agents::{AgentConfig, AgentEvent, GoosePlatform, SessionConfig};
+        use goose::config::permission::PermissionManager;
         use goose::config::GooseMode;
         use goose::conversation::message::{Message, MessageContent};
         use goose::conversation::Conversation;
@@ -2982,9 +3111,11 @@ mod tests {
         use goose_providers::conversation::token_usage::{ProviderUsage, Usage};
         use goose_providers::errors::ProviderError;
         use goose_providers::model::ModelConfig;
-        use rmcp::model::Tool;
+        use rmcp::model::{CallToolRequestParams, Tool};
+        use rmcp::object;
         use std::path::PathBuf;
         use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
 
         fn usage() -> ProviderUsage {
             ProviderUsage::new(
@@ -3002,6 +3133,10 @@ mod tests {
         }
 
         struct AssistantOnlyProvider;
+
+        struct FinalOutputRequestProvider {
+            call_count: AtomicUsize,
+        }
 
         impl goose::providers::base::ProviderDescriptor for AssistantOnlyProvider {
             fn metadata() -> ProviderMetadata {
@@ -3073,6 +3208,14 @@ mod tests {
             }
         }
 
+        impl FinalOutputRequestProvider {
+            fn new() -> Self {
+                Self {
+                    call_count: AtomicUsize::new(0),
+                }
+            }
+        }
+
         impl goose::providers::base::ProviderDescriptor for EmptyThenTextProvider {
             fn metadata() -> ProviderMetadata {
                 ProviderMetadata {
@@ -3129,6 +3272,33 @@ mod tests {
 
             fn get_name(&self) -> &str {
                 "empty-then-text-mock"
+            }
+        }
+
+        #[async_trait]
+        impl Provider for FinalOutputRequestProvider {
+            async fn stream(
+                &self,
+                _model_config: &ModelConfig,
+                _system_prompt: &str,
+                _messages: &[Message],
+                _tools: &[Tool],
+            ) -> Result<MessageStream, ProviderError> {
+                let call = self.call_count.fetch_add(1, Ordering::SeqCst);
+                if call != 0 {
+                    panic!("unexpected provider call after final-output tool request");
+                }
+
+                let tool_call = CallToolRequestParams::new(FINAL_OUTPUT_TOOL_NAME)
+                    .with_arguments(object!({"result": "Final answer"}));
+                Ok(stream_from_single_message(
+                    Message::assistant().with_tool_request("final-output-call", Ok(tool_call)),
+                    usage(),
+                ))
+            }
+
+            fn get_name(&self) -> &str {
+                "final-output-request-mock"
             }
         }
 
@@ -3260,6 +3430,18 @@ mod tests {
                 !persisted.iter().any(is_empty_assistant),
                 "empty assistant turn must not be persisted alongside the fallback: {persisted:?}"
             );
+
+            let emitted_fallback_id = last
+                .id
+                .as_deref()
+                .expect("empty-turn fallback should be emitted with ID");
+            assert!(emitted_fallback_id.starts_with("msg_"));
+
+            let stored_fallback = persisted
+                .iter()
+                .find(|message| message.as_concat_text().contains("empty response"))
+                .expect("empty-turn fallback should be stored");
+            assert_eq!(stored_fallback.id.as_deref(), Some(emitted_fallback_id));
             Ok(())
         }
 
@@ -3337,8 +3519,15 @@ mod tests {
                 .reply(Message::user().with_text("Hi"), session_config, None)
                 .await?;
             tokio::pin!(reply_stream);
+            let mut emitted_steer_id = None;
             while let Some(event) = reply_stream.next().await {
-                event?;
+                if let AgentEvent::Message(message) = event? {
+                    if message.role == rmcp::model::Role::User
+                        && message.as_concat_text().contains("keep going")
+                    {
+                        emitted_steer_id = message.id;
+                    }
+                }
             }
 
             let persisted = agent
@@ -3360,6 +3549,14 @@ mod tests {
                     .any(|m| m.as_concat_text().contains("keep going")),
                 "the queued steer should have been consumed: {persisted:?}"
             );
+            let emitted_steer_id =
+                emitted_steer_id.expect("queued steer should be emitted with ID");
+            assert!(emitted_steer_id.starts_with("msg_"));
+            let stored_steer = persisted
+                .iter()
+                .find(|message| message.as_concat_text().contains("keep going"))
+                .expect("queued steer should be stored");
+            assert_eq!(stored_steer.id.as_deref(), Some(emitted_steer_id.as_str()));
             Ok(())
         }
 
@@ -3400,9 +3597,127 @@ mod tests {
                 .await;
 
             let session_config = SessionConfig {
-                id: session.id,
+                id: session.id.clone(),
                 schedule_id: None,
                 max_turns: Some(3),
+                retry_config: None,
+            };
+
+            let reply_stream = agent
+                .reply(Message::user().with_text("Hi"), session_config, None)
+                .await?;
+            tokio::pin!(reply_stream);
+
+            let mut messages = Vec::new();
+            let mut emitted_nudge_ids = Vec::new();
+            while let Some(event) = reply_stream.next().await {
+                if let AgentEvent::Message(m) = event? {
+                    if m.role == rmcp::model::Role::User
+                        && m.as_concat_text()
+                            .contains(FINAL_OUTPUT_CONTINUATION_MESSAGE)
+                    {
+                        emitted_nudge_ids.push(
+                            m.id.clone()
+                                .expect("Final-output nudge should be emitted with ID"),
+                        );
+                    }
+                    messages.push(m);
+                }
+            }
+
+            let text = concat_text(&messages);
+            assert!(
+                text.contains(FINAL_OUTPUT_CONTINUATION_MESSAGE),
+                "expected the final-output nudge, got: {text:?}"
+            );
+            assert!(
+                !text.contains("empty response"),
+                "empty-turn fallback must not pre-empt the final-output nudge: {text:?}"
+            );
+
+            assert!(
+                !emitted_nudge_ids.is_empty(),
+                "expected at least one emitted final-output nudge"
+            );
+            assert!(emitted_nudge_ids.iter().all(|id| id.starts_with("msg_")));
+
+            let reloaded = agent
+                .config
+                .session_manager
+                .get_session(&session.id, true)
+                .await?;
+            let conversation = reloaded
+                .conversation
+                .expect("Session should have a conversation");
+            let stored_nudge_ids = conversation
+                .messages()
+                .iter()
+                .filter(|message| {
+                    message.role == rmcp::model::Role::User
+                        && message
+                            .as_concat_text()
+                            .contains(FINAL_OUTPUT_CONTINUATION_MESSAGE)
+                })
+                .map(|message| {
+                    message
+                        .id
+                        .clone()
+                        .expect("Stored final-output nudge should have ID")
+                })
+                .collect::<Vec<_>>();
+
+            assert_eq!(stored_nudge_ids, emitted_nudge_ids);
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn test_final_output_result_id_matches_persisted_message() -> Result<()> {
+            use goose::recipe::Response;
+            use goose::session::SessionManager;
+            use tempfile::TempDir;
+
+            let temp_dir = TempDir::new()?;
+            let session_manager = Arc::new(SessionManager::new(temp_dir.path().join("data")));
+            let agent = Agent::with_config(AgentConfig::new(
+                session_manager.clone(),
+                Arc::new(PermissionManager::new(temp_dir.path().join("config"))),
+                None,
+                GooseMode::Auto,
+                true,
+                GoosePlatform::GooseCli,
+            ));
+
+            let session = session_manager
+                .create_session(
+                    PathBuf::default(),
+                    "final-output-result".to_string(),
+                    SessionType::Hidden,
+                    GooseMode::Auto,
+                )
+                .await?;
+            let session_id = session.id.clone();
+            let provider = Arc::new(FinalOutputRequestProvider::new());
+            agent
+                .update_provider(
+                    provider.clone(),
+                    ModelConfig::new("mock-model"),
+                    &session.id,
+                )
+                .await?;
+            agent
+                .add_final_output_tool(Response {
+                    json_schema: Some(serde_json::json!({
+                        "type": "object",
+                        "properties": { "result": { "type": "string" } },
+                        "required": ["result"]
+                    })),
+                })
+                .await;
+
+            let session_config = SessionConfig {
+                id: session.id,
+                schedule_id: None,
+                max_turns: Some(5),
                 retry_config: None,
             };
 
@@ -3418,15 +3733,38 @@ mod tests {
                 }
             }
 
-            let text = concat_text(&messages);
-            assert!(
-                text.contains(FINAL_OUTPUT_CONTINUATION_MESSAGE),
-                "expected the final-output nudge, got: {text:?}"
+            let emitted_final_output = messages
+                .iter()
+                .find(|message| {
+                    message.role == rmcp::model::Role::Assistant
+                        && message.as_concat_text().contains("Final answer")
+                })
+                .expect("final-output result should be emitted");
+            let emitted_final_output_id = emitted_final_output
+                .id
+                .as_deref()
+                .expect("final-output result should be emitted with ID");
+            assert!(emitted_final_output_id.starts_with("msg_"));
+
+            let persisted = session_manager
+                .get_session(&session_id, true)
+                .await?
+                .conversation
+                .map(|c| c.messages().to_vec())
+                .unwrap_or_default();
+            let stored_final_output = persisted
+                .iter()
+                .find(|message| {
+                    message.role == rmcp::model::Role::Assistant
+                        && message.as_concat_text().contains("Final answer")
+                })
+                .expect("final-output result should be stored");
+
+            assert_eq!(
+                stored_final_output.id.as_deref(),
+                Some(emitted_final_output_id)
             );
-            assert!(
-                !text.contains("empty response"),
-                "empty-turn fallback must not pre-empt the final-output nudge: {text:?}"
-            );
+            assert_eq!(provider.call_count.load(Ordering::SeqCst), 1);
             Ok(())
         }
 
@@ -3551,6 +3889,15 @@ mod tests {
                 text.contains("Maximum retry attempts"),
                 "exhausted recipe retries must surface the failure message: {text:?}"
             );
+            let emitted_failure = messages
+                .iter()
+                .find(|message| message.as_concat_text().contains("Maximum retry attempts"))
+                .expect("max-retry failure message should be emitted");
+            let emitted_failure_id = emitted_failure
+                .id
+                .as_deref()
+                .expect("max-retry failure message should be emitted with ID");
+            assert!(emitted_failure_id.starts_with("msg_"));
 
             let persisted = agent
                 .config
@@ -3564,6 +3911,11 @@ mod tests {
                 concat_text(&persisted).contains("Maximum retry attempts"),
                 "the max-retry failure message must be persisted: {persisted:?}"
             );
+            let stored_failure = persisted
+                .iter()
+                .find(|message| message.as_concat_text().contains("Maximum retry attempts"))
+                .expect("max-retry failure message should be stored");
+            assert_eq!(stored_failure.id.as_deref(), Some(emitted_failure_id));
             Ok(())
         }
     }

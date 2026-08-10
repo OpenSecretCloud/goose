@@ -1226,6 +1226,15 @@
   "externalBackendSection.useExternalServerDescription": {
     "defaultMessage": "Terhubung ke server goose yang berjalan di tempat lain (memerlukan mulai ulang aplikasi)"
   },
+  "externalBackendSection.workingDir": {
+    "defaultMessage": "Direktori kerja jarak jauh (opsional)"
+  },
+  "externalBackendSection.workingDirHelp": {
+    "defaultMessage": "Jalur absolut pada backend eksternal. Biarkan kosong untuk mengirim direktori kerja lokal."
+  },
+  "externalBackendSection.workingDirPlaceholder": {
+    "defaultMessage": "/home/goose/workspace"
+  },
   "goosehintsModal.close": {
     "defaultMessage": "Tutup"
   },
@@ -2360,8 +2369,35 @@
   "navigationPanel.chats": {
     "defaultMessage": "Obrolan"
   },
+  "navigationPanel.metaCreated": {
+    "defaultMessage": "Dibuat"
+  },
+  "navigationPanel.metaDirectory": {
+    "defaultMessage": "Direktori"
+  },
+  "navigationPanel.metaModel": {
+    "defaultMessage": "Model"
+  },
+  "navigationPanel.metaStatus": {
+    "defaultMessage": "Status"
+  },
+  "navigationPanel.metaUpdated": {
+    "defaultMessage": "Diperbarui"
+  },
   "navigationPanel.noChats": {
     "defaultMessage": "Tidak ada obrolan terbaru"
+  },
+  "navigationPanel.statusError": {
+    "defaultMessage": "Kesalahan"
+  },
+  "navigationPanel.statusIdle": {
+    "defaultMessage": "Menganggur"
+  },
+  "navigationPanel.statusStreaming": {
+    "defaultMessage": "Streaming"
+  },
+  "navigationPanel.statusUnread": {
+    "defaultMessage": "Aktivitas belum dibaca"
   },
   "navigationPanel.untitledSession": {
     "defaultMessage": "Sesi tanpa judul"
@@ -3025,12 +3061,6 @@
   },
   "recipeModelSelector.useDefaultProvider": {
     "defaultMessage": "Gunakan penyedia default"
-  },
-  "recipeNameField.defaultLabel": {
-    "defaultMessage": "Nama Resep"
-  },
-  "recipeNameField.formatHint": {
-    "defaultMessage": "Akan diformat secara otomatis (huruf kecil, tanda hubung untuk spasi)"
   },
   "recipeWarningModal.cancel": {
     "defaultMessage": "Batal"
@@ -3737,24 +3767,6 @@
   "sessionIndicators.streaming": {
     "defaultMessage": "Streaming"
   },
-  "sessionViewComponents.empty.description": {
-    "defaultMessage": "Sesi ini tidak berisi pesan apa pun"
-  },
-  "sessionViewComponents.empty.title": {
-    "defaultMessage": "Tidak ada pesan ditemukan"
-  },
-  "sessionViewComponents.error.loading": {
-    "defaultMessage": "Kesalahan Memuat Detail Sesi"
-  },
-  "sessionViewComponents.error.tryAgain": {
-    "defaultMessage": "Coba Lagi"
-  },
-  "sessionViewComponents.role.assistant": {
-    "defaultMessage": "Goose"
-  },
-  "sessionViewComponents.role.user": {
-    "defaultMessage": "Anda"
-  },
   "sessions.action.delete": {
     "defaultMessage": "Hapus sesi"
   },
@@ -3766,6 +3778,12 @@
   },
   "sessions.action.export": {
     "defaultMessage": "Ekspor sesi"
+  },
+  "sessions.action.exportJson": {
+    "defaultMessage": "JSON"
+  },
+  "sessions.action.exportMarkdown": {
+    "defaultMessage": "Markdown"
   },
   "sessions.action.openNewWindow": {
     "defaultMessage": "Buka di jendela baru"
@@ -3865,6 +3883,9 @@
   },
   "sessions.toast.duplicated": {
     "defaultMessage": "Sesi \"{name}\" berhasil digandakan"
+  },
+  "sessions.toast.exportFailed": {
+    "defaultMessage": "Gagal mengekspor sesi: {error}"
   },
   "sessions.toast.exported": {
     "defaultMessage": "Sesi berhasil diekspor"
@@ -4082,9 +4103,6 @@
   "settingsView.title": {
     "defaultMessage": "Pengaturan"
   },
-  "sheet.close": {
-    "defaultMessage": "Tutup"
-  },
   "shortcutRecorder.cancel": {
     "defaultMessage": "Batal"
   },
@@ -4150,15 +4168,6 @@
   },
   "stringUtils.configuredProvider": {
     "defaultMessage": "Penyedia {name} telah dikonfigurasi"
-  },
-  "stringUtils.ollamaApp": {
-    "defaultMessage": "Aplikasi Ollama"
-  },
-  "stringUtils.ollamaNotConfiguredPrefix": {
-    "defaultMessage": "Untuk menggunakan, salah satu"
-  },
-  "stringUtils.ollamaNotConfiguredSuffix": {
-    "defaultMessage": "harus terpasang di mesin Anda dan terbuka, atau Anda harus memasukkan nilai untuk OLLAMA_HOST."
   },
   "subRecipeEditor.addExisting": {
     "defaultMessage": "Tambahkan yang Sudah Ada"
@@ -4574,6 +4583,9 @@
   "userMessage.editButton": {
     "defaultMessage": "Edit"
   },
+  "userMessage.editImagesHeading": {
+    "defaultMessage": "Gambar terlampir:"
+  },
   "userMessage.editInPlace": {
     "defaultMessage": "Edit di Tempat"
   },
@@ -4606,5 +4618,8 @@
   },
   "userMessage.forkSessionTitle": {
     "defaultMessage": "Buat sesi baru dengan pesan yang diedit"
+  },
+  "userMessage.removeImageFromEdit": {
+    "defaultMessage": "Hapus gambar dari pesan"
   }
 }

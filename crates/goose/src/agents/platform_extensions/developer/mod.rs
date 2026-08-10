@@ -1,6 +1,7 @@
 pub mod edit;
 pub mod image;
 pub mod shell;
+mod shell_output_streaming;
 pub mod tree;
 
 use crate::agents::extension::PlatformExtensionContext;
@@ -190,6 +191,7 @@ impl McpClientTrait for DeveloperClient {
             tools: Self::get_tools(),
             next_cursor: None,
             meta: None,
+            ..Default::default()
         })
     }
 
@@ -205,7 +207,13 @@ impl McpClientTrait for DeveloperClient {
             "shell" => match Self::parse_args::<ShellParams>(arguments) {
                 Ok(params) => Ok(self
                     .shell_tool
-                    .shell_with_cwd(params, working_dir, Some(&ctx.session_id), cancel_token)
+                    .shell_with_cwd_and_emitter(
+                        params,
+                        working_dir,
+                        Some(&ctx.session_id),
+                        ctx.notification_emitter().cloned(),
+                        cancel_token,
+                    )
                     .await),
                 Err(error) => Ok(ShellTool::error_result(&format!("Error: {error}"), None)),
             },
@@ -281,6 +289,7 @@ mod tests {
         PlatformExtensionContext {
             extension_manager: None,
             session_manager: Arc::new(SessionManager::new(data_dir)),
+            scheduler: None,
             session: None,
             use_login_shell_path: false,
         }

@@ -9,11 +9,12 @@ use serde_json::{json, Value};
 use tracing::debug;
 
 use super::super::agents::Agent;
+use super::gen_ai_telemetry;
 #[cfg(feature = "code-mode")]
 use crate::agents::platform_extensions::code_execution;
 use crate::config::{Config, GooseMode};
 use crate::conversation::message::{Message, MessageContent, MessageUsage, ToolRequest};
-use crate::conversation::{fix_conversation, Conversation};
+use crate::conversation::{fix_conversation, merge_consecutive_messages_for_request, Conversation};
 #[cfg(test)]
 use crate::providers::base::stream_from_single_message;
 use crate::providers::base::{MessageStream, Provider};
@@ -168,13 +169,26 @@ fn message_has_timing_content(message: &Message) -> bool {
         .any(|content| !matches!(content, MessageContent::SystemNotification(_)))
 }
 
+fn is_mergeable_assistant_chunk(message: &Message) -> bool {
+    message.role == rmcp::model::Role::Assistant
+        && !message.content.is_empty()
+        && message.content.iter().all(|content| {
+            matches!(
+                content,
+                MessageContent::Text(_)
+                    | MessageContent::Thinking(_)
+                    | MessageContent::RedactedThinking(_)
+            )
+        })
+}
+
 impl Agent {
     pub async fn prepare_tools_and_prompt(
         &self,
         session_id: &str,
         working_dir: &std::path::Path,
     ) -> Result<(Vec<Tool>, Vec<Tool>, String, ModelConfig)> {
-        let mut tools = self.list_tools(session_id, None).await;
+        let tools = self.list_tools(session_id, None).await;
 
         #[cfg(feature = "code-mode")]
         let code_execution_active = self
@@ -183,70 +197,14 @@ impl Agent {
             .await;
         #[cfg(not(feature = "code-mode"))]
         let code_execution_active = false;
-        #[cfg(feature = "code-mode")]
-        if code_execution_active {
-            let disclosure_style =
-                crate::agents::platform_extensions::code_execution::get_tool_disclosure();
 
-            tools = tools
-                .into_iter()
-                .filter_map(|mut t| match disclosure_style {
-                    pctx_code_mode::config::ToolDisclosure::Catalog
-                    | pctx_code_mode::config::ToolDisclosure::Filesystem => {
-                        // in catalog & filesystem styles, progressive search is handled
-                        // by pctx, so we want to omit all non-first-class extensions
-                        // from the standard tool list
-                        if crate::agents::extension_manager::get_tool_owner(&t).is_some_and(|o| {
-                            crate::agents::extension_manager::is_first_class_extension(&o)
-                        }) || crate::agents::extension_manager::get_tool_resource_uri(&t)
-                            .is_some()
-                        {
-                            Some(t)
-                        } else {
-                            None
-                        }
-                    }
-                    pctx_code_mode::config::ToolDisclosure::Sidecar => {
-                        // in sidecar style there is no progressive search, just a way to chain tools
-                        // together with typescript
-                        // add output schema to description since many model providers drop the
-                        // output schema when presenting tools to the model
-                        let output_schema = t
-                            .output_schema
-                            .as_ref()
-                            .map(|s| serde_json::json!(s).to_string())
-                            .unwrap_or("unknown".to_string());
-                        let description_extension = format!(
-                            "The successful return schema of this tool is:\n{output_schema}"
-                        );
-
-                        t.description = Some(
-                            t.description
-                                .map(|t| format!("{t}\n{description_extension}"))
-                                .unwrap_or(description_extension)
-                                .into(),
-                        );
-
-                        Some(t)
-                    }
-                })
-                .collect();
-        }
-
-        // Filter out tools not visible to the model per MCP Apps visibility spec.
-        // Tools with `_meta.ui.visibility` that doesn't include "model" are app-only.
-        tools.retain(is_tool_visible_to_model);
-
-        // Stable tool ordering is important for multi session prompt caching.
-        tools.sort_by(|a, b| a.name.cmp(&b.name));
+        let tools = prepare_inference_tools(tools, code_execution_active);
 
         // Prepare system prompt
         let extensions_info = self
             .extension_manager
             .get_extensions_info(working_dir)
             .await;
-        let (extension_count, tool_count) = self.total_extension_and_tool_counts(session_id).await;
-
         let model_config = self.model_config_for_session(session_id).await?;
 
         let goose_mode = *self.current_goose_mode.lock().await;
@@ -256,171 +214,359 @@ impl Agent {
         }
 
         let prompt_manager = self.prompt_manager.lock().await;
-        let mut system_prompt = prompt_manager
+        let system_prompt = prompt_manager
             .builder()
             .with_extensions(extensions_info.into_iter())
             .with_frontend_instructions(self.frontend_instructions.lock().await.clone())
-            .with_extension_and_tool_counts(extension_count, tool_count)
             .with_code_execution_mode(code_execution_active)
             .with_hints(working_dir)
             .with_goose_mode(goose_mode)
             .build();
 
-        // Handle toolshim if enabled
-        let mut toolshim_tools = vec![];
-        if model_config.toolshim {
-            // If tool interpretation is enabled, modify the system prompt
-            system_prompt = modify_system_prompt_for_tool_json(&system_prompt, &tools);
-            // Make a copy of tools before emptying
-            toolshim_tools = tools.clone();
-            // Empty the tools vector for provider completion
-            tools = vec![];
-        }
+        let (tools, toolshim_tools, system_prompt) =
+            prepare_tools_for_provider(tools, system_prompt, &model_config);
 
         Ok((tools, toolshim_tools, system_prompt, model_config))
     }
+}
 
-    #[tracing::instrument(
-        skip(provider, model_config, session_id, system_prompt, messages, tools, toolshim_tools),
-        fields(session.id = %session_id)
-    )]
-    pub(crate) async fn stream_response_from_provider(
-        provider: Arc<dyn Provider>,
-        model_config: ModelConfig,
-        session_id: &str,
-        system_prompt: &str,
-        messages: &[Message],
-        tools: &[Tool],
-        toolshim_tools: &[Tool],
-    ) -> Result<MessageStream, ProviderError> {
-        let config = model_config.clone();
+pub(crate) fn prepare_inference_tools(
+    mut tools: Vec<Tool>,
+    code_execution_active: bool,
+) -> Vec<Tool> {
+    #[cfg(feature = "code-mode")]
+    if code_execution_active {
+        let disclosure_style =
+            crate::agents::platform_extensions::code_execution::get_tool_disclosure();
 
-        let projected_messages =
-            Conversation::new_unvalidated(messages.iter().cloned()).agent_visible_messages();
-        let (filtered_messages, _) =
-            fix_conversation(Conversation::new_unvalidated(projected_messages));
-
-        // Convert tool messages to text if toolshim is enabled
-        let messages_for_provider = if config.toolshim {
-            convert_tool_messages_to_text(filtered_messages.messages())
-        } else {
-            filtered_messages
-        };
-
-        // Clone owned data to move into the async stream
-        let system_prompt = system_prompt.to_owned();
-        let tools = tools.to_owned();
-        let toolshim_tools = toolshim_tools.to_owned();
-        let provider = provider.clone();
-
-        // Capture errors during stream creation and return them as part of the stream
-        // so they can be handled by the existing error handling logic in the agent
-        let model_config =
-            model_config.with_default_thinking_effort(Config::global().get_goose_thinking_effort());
-        let request_started = std::time::Instant::now();
-        debug!("WAITING_LLM_STREAM_START");
-        let stream_result = crate::session_context::with_session_id(
-            Some(session_id.to_string()),
-            provider.stream(
-                &model_config,
-                system_prompt.as_str(),
-                messages_for_provider.messages(),
-                &tools,
-            ),
-        )
-        .await;
-        debug!("WAITING_LLM_STREAM_END");
-
-        // If there was an error creating the stream, return a stream that yields that error
-        let mut stream = match stream_result {
-            Ok(s) => s,
-            Err(e) => {
-                let enhanced_error = enhance_model_error(e, &provider, config.toolshim).await;
-                // Return a stream that immediately yields the error
-                // This allows the error to be caught by existing error handling in agent.rs
-                return Ok(Box::pin(try_stream! {
-                    yield Err(enhanced_error)?;
-                }));
-            }
-        };
-
-        Ok(Box::pin(try_stream! {
-            if config.toolshim {
-                // Toolshim mode: accumulate the full response before processing
-                // so that tool-use markers spanning multiple chunks are detected
-                // and stripped before any output reaches the UI.
-                let mut accumulated_message: Option<Message> = None;
-                let mut final_usage: Option<ProviderUsage> = None;
-                let mut first_content_at: Option<std::time::Instant> = None;
-
-                while let Some(result) = stream.next().await {
-                    let (msg_opt, usage_opt) = result?;
-
-                    if let Some(msg) = msg_opt {
-                        if first_content_at.is_none() && message_has_timing_content(&msg) {
-                            first_content_at = Some(std::time::Instant::now());
-                        }
-                        accumulated_message = Some(match accumulated_message {
-                            Some(mut prev) => {
-                                for new_content in msg.content {
-                                    match (&mut prev.content.last_mut(), &new_content) {
-                                        (
-                                            Some(MessageContent::Text(last_text)),
-                                            MessageContent::Text(new_text),
-                                        ) if last_text.annotations.as_ref().and_then(|a| a.audience.as_ref()) == new_text.annotations.as_ref().and_then(|a| a.audience.as_ref()) => {
-                                            last_text.text.push_str(&new_text.text);
-                                        }
-                                        _ => {
-                                            prev.content.push(new_content);
-                                        }
-                                    }
-                                }
-                                prev
-                            }
-                            None => msg,
-                        });
-                    }
-
-                    if let Some(usage) = usage_opt {
-                        final_usage = Some(usage);
-                    }
-
-                    // Yield empty item so the agent loop can check cancellation
-                    yield (None, None);
-                }
-
-                // The toolshim interpreter call below must not count toward elapsed time.
-                if let Some(usage) = final_usage.as_mut() {
-                    fill_stream_timing(usage, request_started, first_content_at);
-                }
-
-                if let Some(msg) = accumulated_message {
-                    let processed = toolshim_postprocess(msg, &toolshim_tools).await?;
-                    yield (Some(processed), final_usage);
-                } else if final_usage.is_some() {
-                    // Preserve usage-only responses (no message content)
-                    yield (None, final_usage);
-                }
-            } else {
-                let mut first_content_at: Option<std::time::Instant> = None;
-                while let Some(result) = stream.next().await {
-                    let (message, mut usage) = result?;
-
-                    if first_content_at.is_none()
-                        && message.as_ref().is_some_and(message_has_timing_content)
+        tools = tools
+            .into_iter()
+            .filter_map(|mut tool| match disclosure_style {
+                pctx_code_mode::config::ToolDisclosure::Catalog
+                | pctx_code_mode::config::ToolDisclosure::Filesystem => {
+                    // in catalog & filesystem styles, progressive search is handled
+                    // by pctx, so we want to omit all non-first-class extensions
+                    // from the standard tool list
+                    if crate::agents::extension_manager::get_tool_owner(&tool).is_some_and(
+                        |owner| crate::agents::extension_manager::is_first_class_extension(&owner),
+                    ) || crate::agents::extension_manager::get_tool_resource_uri(&tool).is_some()
                     {
-                        first_content_at = Some(std::time::Instant::now());
+                        Some(tool)
+                    } else {
+                        None
                     }
-                    if let Some(usage) = usage.as_mut() {
-                        fill_stream_timing(usage, request_started, first_content_at);
-                    }
-
-                    yield (message, usage);
                 }
-            }
-        }))
+                pctx_code_mode::config::ToolDisclosure::Sidecar => {
+                    // in sidecar style there is no progressive search, just a way to chain tools
+                    // together with typescript
+                    // add output schema to description since many model providers drop the
+                    // output schema when presenting tools to the model
+                    let output_schema = tool
+                        .output_schema
+                        .as_ref()
+                        .map(|schema| serde_json::json!(schema).to_string())
+                        .unwrap_or("unknown".to_string());
+                    let description =
+                        format!("The successful return schema of this tool is:\n{output_schema}");
+                    tool.description = Some(
+                        tool.description
+                            .map(|current| format!("{current}\n{description}"))
+                            .unwrap_or(description)
+                            .into(),
+                    );
+                    Some(tool)
+                }
+            })
+            .collect();
     }
 
+    #[cfg(not(feature = "code-mode"))]
+    let _ = code_execution_active;
+
+    // Filter out tools not visible to the model per MCP Apps visibility spec.
+    // Tools with `_meta.ui.visibility` that doesn't include "model" are app-only.
+    tools.retain(is_tool_visible_to_model);
+
+    // Stable tool ordering is important for multi session prompt caching.
+    tools.sort_by(|a, b| a.name.cmp(&b.name));
+    tools
+}
+
+pub(crate) fn prepare_tools_for_provider(
+    tools: Vec<Tool>,
+    system_prompt: String,
+    model_config: &ModelConfig,
+) -> (Vec<Tool>, Vec<Tool>, String) {
+    if model_config.toolshim {
+        let system_prompt = modify_system_prompt_for_tool_json(&system_prompt, &tools);
+        (Vec::new(), tools, system_prompt)
+    } else {
+        (tools, Vec::new(), system_prompt)
+    }
+}
+
+#[tracing::instrument(
+    skip(provider, model_config, session_id, system_prompt, messages, tools, toolshim_tools),
+    fields(
+        session.id = %session_id,
+        gen_ai.conversation.id = %session_id,
+        gen_ai.operation.name = "chat",
+        gen_ai.provider.name = %provider.get_name(),
+        gen_ai.request.model = %model_config.model_name,
+        gen_ai.request.stream = true,
+        gen_ai.response.model = tracing::field::Empty,
+        gen_ai.usage.input_tokens = tracing::field::Empty,
+        gen_ai.usage.output_tokens = tracing::field::Empty,
+        gen_ai.usage.cache_read.input_tokens = tracing::field::Empty,
+        gen_ai.usage.cache_creation.input_tokens = tracing::field::Empty,
+        gen_ai.input.messages = tracing::field::Empty,
+        gen_ai.output.messages = tracing::field::Empty,
+    )
+)]
+pub(crate) async fn stream_response_from_provider(
+    provider: Arc<dyn Provider>,
+    model_config: ModelConfig,
+    session_id: &str,
+    system_prompt: &str,
+    messages: &[Message],
+    tools: &[Tool],
+    toolshim_tools: &[Tool],
+) -> Result<MessageStream, ProviderError> {
+    let config = model_config.clone();
+
+    let projected_messages =
+        Conversation::new_unvalidated(messages.iter().cloned()).agent_visible_messages();
+    let (filtered_messages, _) =
+        fix_conversation(Conversation::new_unvalidated(projected_messages));
+    let filtered_messages = Conversation::new_unvalidated(merge_consecutive_messages_for_request(
+        filtered_messages.messages().clone(),
+    ));
+
+    // Convert tool messages to text if toolshim is enabled
+    let messages_for_provider = if config.toolshim {
+        convert_tool_messages_to_text(filtered_messages.messages())
+    } else {
+        filtered_messages
+    };
+    let span = tracing::Span::current();
+    let capture_message_content = gen_ai_telemetry::capture_message_content();
+    if capture_message_content {
+        let input_messages =
+            gen_ai_telemetry::input_messages_json(messages_for_provider.messages());
+        span.record("gen_ai.input.messages", input_messages.as_str());
+    }
+
+    // Clone owned data to move into the async stream
+    let system_prompt = system_prompt.to_owned();
+    let session_id = session_id.to_owned();
+    let tools = tools.to_owned();
+    let toolshim_tools = toolshim_tools.to_owned();
+    let provider = provider.clone();
+
+    // Capture errors during stream creation and return them as part of the stream
+    // so they can be handled by the existing error handling logic in the agent
+    let model_config =
+        model_config.with_default_thinking_effort(Config::global().get_goose_thinking_effort());
+    let request_started = std::time::Instant::now();
+    debug!("WAITING_LLM_STREAM_START");
+    let stream_result = crate::session_context::with_session_id(
+        Some(session_id.clone()),
+        provider.stream(
+            &model_config,
+            system_prompt.as_str(),
+            messages_for_provider.messages(),
+            &tools,
+        ),
+    )
+    .await;
+    debug!("WAITING_LLM_STREAM_END");
+
+    // If there was an error creating the stream, return a stream that yields that error
+    let mut stream = match stream_result {
+        Ok(s) => s,
+        Err(e) => {
+            let enhanced_error = enhance_model_error(e, &provider, config.toolshim).await;
+            // Return a stream that immediately yields the error
+            // This allows the error to be caught by existing error handling in agent.rs
+            return Ok(Box::pin(try_stream! {
+                yield Err(enhanced_error)?;
+            }));
+        }
+    };
+
+    Ok(Box::pin(try_stream! {
+        if !provider.manages_own_context() {
+            let retry_config = provider.retry_config().transient_only();
+            let mut attempts = 0;
+
+            loop {
+                match stream.next().await {
+                    None => break,
+                    Some(Ok(item)) => {
+                        stream = Box::pin(
+                            futures::stream::once(std::future::ready(Ok(item))).chain(stream),
+                        );
+                        break;
+                    }
+                    Some(Err(error))
+                        if goose_providers::retry::should_retry(&error, &retry_config)
+                            && attempts < retry_config.max_retries =>
+                    {
+                        attempts += 1;
+                        let delay = match &error {
+                            ProviderError::RateLimitExceeded {
+                                retry_delay: Some(provider_delay),
+                                ..
+                            } => *provider_delay,
+                            _ => retry_config.delay_for_attempt(attempts),
+                        };
+                        warn!(
+                            "Provider stream failed before its first item, retrying ({}/{}): {:?}",
+                            attempts, retry_config.max_retries, error
+                        );
+
+                        let skip_backoff = std::env::var("GOOSE_PROVIDER_SKIP_BACKOFF")
+                            .unwrap_or_default()
+                            .parse::<bool>()
+                            .unwrap_or(false);
+                        if !skip_backoff {
+                            tokio::time::sleep(delay).await;
+                        }
+
+                        stream = match crate::session_context::with_session_id(
+                            Some(session_id.clone()),
+                            provider.stream(
+                                &model_config,
+                                system_prompt.as_str(),
+                                messages_for_provider.messages(),
+                                &tools,
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(stream) => stream,
+                            Err(error) => {
+                                Err(enhance_model_error(error, &provider, config.toolshim).await)?
+                            }
+                        };
+                    }
+                    Some(Err(error)) => Err(error)?,
+                }
+            }
+        }
+
+        if config.toolshim {
+            // Toolshim mode: accumulate the full response before processing
+            // so that tool-use markers spanning multiple chunks are detected
+            // and stripped before any output reaches the UI.
+            let mut accumulated_message: Option<Message> = None;
+            let mut final_usage: Option<ProviderUsage> = None;
+            let mut first_content_at: Option<std::time::Instant> = None;
+
+            while let Some(result) = stream.next().await {
+                let (msg_opt, usage_opt) = result?;
+
+                if let Some(msg) = msg_opt {
+                    if first_content_at.is_none() && message_has_timing_content(&msg) {
+                        first_content_at = Some(std::time::Instant::now());
+                    }
+                    accumulated_message = Some(match accumulated_message {
+                        Some(mut prev) => {
+                            for new_content in msg.content {
+                                match (&mut prev.content.last_mut(), &new_content) {
+                                    (
+                                        Some(MessageContent::Text(last_text)),
+                                        MessageContent::Text(new_text),
+                                    ) if last_text.annotations.as_ref().and_then(|a| a.audience.as_ref())
+                                        == new_text.annotations.as_ref().and_then(|a| a.audience.as_ref()) => {
+                                        last_text.text.push_str(&new_text.text);
+                                    }
+                                    _ => {
+                                        prev.content.push(new_content);
+                                    }
+                                }
+                            }
+                            prev
+                        }
+                        None => msg,
+                    });
+                }
+
+                if let Some(usage) = usage_opt {
+                    final_usage = Some(usage);
+                }
+
+                // Yield empty item so the agent loop can check cancellation
+                yield (None, None);
+            }
+
+            // The toolshim interpreter call below must not count toward elapsed time.
+            if let Some(usage) = final_usage.as_mut() {
+                fill_stream_timing(usage, request_started, first_content_at);
+                gen_ai_telemetry::record_provider_usage(&span, usage);
+            }
+
+            if let Some(msg) = accumulated_message {
+                let processed = toolshim_postprocess(msg, &toolshim_tools)
+                    .await?
+                    .with_generated_id_if_missing();
+                if capture_message_content {
+                    let output_messages = gen_ai_telemetry::output_message_json(&processed);
+                    span.record("gen_ai.output.messages", output_messages.as_str());
+                }
+                yield (Some(processed), final_usage);
+            } else if final_usage.is_some() {
+                // Preserve usage-only responses (no message content)
+                yield (None, final_usage);
+            }
+        } else {
+            let mut first_content_at: Option<std::time::Instant> = None;
+            let mut active_mergeable_assistant_id: Option<String> = None;
+            let mut output_message: Option<Message> = None;
+            while let Some(result) = stream.next().await {
+                let (message, mut usage) = result?;
+
+                if first_content_at.is_none()
+                    && message.as_ref().is_some_and(message_has_timing_content)
+                {
+                    first_content_at = Some(std::time::Instant::now());
+                }
+                if let Some(usage) = usage.as_mut() {
+                    fill_stream_timing(usage, request_started, first_content_at);
+                    gen_ai_telemetry::record_provider_usage(&span, usage);
+                }
+                if capture_message_content {
+                    if let Some(message) = message.as_ref() {
+                        gen_ai_telemetry::append_message(&mut output_message, message);
+                    }
+                }
+
+                let message = message.map(|message| {
+                    if message.id.is_some() {
+                        active_mergeable_assistant_id = None;
+                        message
+                    } else if is_mergeable_assistant_chunk(&message) {
+                        let id = active_mergeable_assistant_id
+                            .get_or_insert_with(|| format!("msg_{}", uuid::Uuid::new_v4()))
+                            .clone();
+                        message.with_id(id)
+                    } else {
+                        active_mergeable_assistant_id = None;
+                        message.with_generated_id()
+                    }
+                });
+
+                yield (message, usage);
+            }
+            if let Some(output_message) = output_message {
+                let output_messages = gen_ai_telemetry::output_message_json(&output_message);
+                span.record("gen_ai.output.messages", output_messages.as_str());
+            }
+        }
+    }))
+}
+
+impl Agent {
     /// Categorize tool requests from the response into different types
     /// Returns:
     /// - frontend_requests: Tool requests that should be handled by the frontend
@@ -538,6 +684,8 @@ impl Agent {
 
         let mut filtered_message =
             Message::new(response.role.clone(), response.created, filtered_content);
+        filtered_message.metadata.output_token_limit_reached =
+            response.metadata.output_token_limit_reached;
 
         // Preserve the ID if it exists
         if let Some(id) = response.id.clone() {
@@ -676,6 +824,7 @@ pub fn is_tool_visible_to_model(tool: &Tool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agents::gen_ai_telemetry::{self, test_support::SpanFieldCapture};
     use crate::agents::{AgentConfig, GoosePlatform};
     use crate::config::permission::PermissionLevel;
     use crate::config::{GooseMode, PermissionManager};
@@ -713,6 +862,33 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct GenAiTracingProvider;
+
+    #[async_trait]
+    impl Provider for GenAiTracingProvider {
+        fn get_name(&self) -> &str {
+            "test-provider"
+        }
+
+        async fn stream(
+            &self,
+            _model_config: &ModelConfig,
+            _system: &str,
+            _messages: &[Message],
+            _tools: &[Tool],
+        ) -> Result<MessageStream, ProviderError> {
+            let usage = ProviderUsage::new(
+                "resolved-model".to_string(),
+                Usage::new(Some(11), Some(7), Some(18)).with_cache_tokens(Some(3), Some(2)),
+            );
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok((Some(Message::assistant().with_text("hello ")), None)),
+                Ok((Some(Message::assistant().with_text("world")), Some(usage))),
+            ])))
+        }
+    }
+
+    #[derive(Clone)]
     struct CapturingProvider {
         messages: Arc<Mutex<Vec<Message>>>,
     }
@@ -738,6 +914,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_stream_records_gen_ai_span_attributes() {
+        use futures::StreamExt;
+        use goose_test_support::otel::clear_otel_env;
+
+        let _env = clear_otel_env(&[(gen_ai_telemetry::CAPTURE_MESSAGE_CONTENT_ENV, "true")]);
+        let capture = SpanFieldCapture::new("stream_response_from_provider");
+        let _subscriber = capture.clone().set_default();
+        let messages = vec![Message::user().with_text("Say hello")];
+
+        let mut stream = stream_response_from_provider(
+            Arc::new(GenAiTracingProvider),
+            ModelConfig::new("requested-model"),
+            "test-session",
+            "system",
+            &messages,
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+        while let Some(item) = stream.next().await {
+            item.unwrap();
+        }
+        drop(stream);
+
+        let fields = capture.fields();
+        assert_eq!(fields["gen_ai.operation.name"], "chat");
+        assert_eq!(fields["gen_ai.provider.name"], "test-provider");
+        assert_eq!(fields["gen_ai.request.model"], "requested-model");
+        assert_eq!(fields["gen_ai.request.stream"], true);
+        assert_eq!(fields["gen_ai.conversation.id"], "test-session");
+        assert_eq!(fields["gen_ai.response.model"], "resolved-model");
+        assert_eq!(fields["gen_ai.usage.input_tokens"], 11);
+        assert_eq!(fields["gen_ai.usage.output_tokens"], 7);
+        assert_eq!(fields["gen_ai.usage.cache_read.input_tokens"], 3);
+        assert_eq!(fields["gen_ai.usage.cache_creation.input_tokens"], 2);
+
+        let input: Value =
+            serde_json::from_str(fields["gen_ai.input.messages"].as_str().unwrap()).unwrap();
+        assert_eq!(input[0]["parts"][0]["content"], "Say hello");
+
+        let output: Value =
+            serde_json::from_str(fields["gen_ai.output.messages"].as_str().unwrap()).unwrap();
+        assert_eq!(output[0]["finish_reason"], "stop");
+        assert_eq!(output[0]["parts"][0]["content"], "hello world");
+    }
+
+    #[tokio::test]
     async fn provider_input_drops_rows_empty_after_agent_projection() {
         let user_only = TextContent::new("user-only ACP output")
             .with_annotations(Annotations::default().with_audience(vec![Role::User]));
@@ -750,7 +974,7 @@ mod tests {
             messages: captured.clone(),
         });
 
-        let _stream = crate::agents::Agent::stream_response_from_provider(
+        let _stream = stream_response_from_provider(
             provider,
             ModelConfig::new("test-model"),
             "test-session",
@@ -782,7 +1006,7 @@ mod tests {
             messages: captured.clone(),
         });
 
-        let _stream = crate::agents::Agent::stream_response_from_provider(
+        let _stream = stream_response_from_provider(
             provider,
             ModelConfig::new("test-model"),
             "test-session",
@@ -826,7 +1050,7 @@ mod tests {
             messages: captured.clone(),
         });
 
-        let _stream = crate::agents::Agent::stream_response_from_provider(
+        let _stream = stream_response_from_provider(
             provider,
             ModelConfig::new("test-model"),
             "test-session",
@@ -1038,20 +1262,257 @@ mod tests {
         );
     }
 
+    struct MixedMessageIdStreamProvider;
+
+    #[async_trait]
+    impl Provider for MixedMessageIdStreamProvider {
+        fn get_name(&self) -> &str {
+            "mixed-message-id-stream"
+        }
+
+        async fn stream(
+            &self,
+            _model_config: &ModelConfig,
+            _system: &str,
+            _messages: &[Message],
+            _tools: &[Tool],
+        ) -> Result<MessageStream, ProviderError> {
+            type StreamItem = Result<(Option<Message>, Option<ProviderUsage>), ProviderError>;
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok((Some(Message::assistant().with_text("Hel")), None)),
+                Ok((Some(Message::assistant().with_text("lo")), None)),
+                Ok((
+                    Some(Message::assistant().with_action_required(
+                        "permission-a",
+                        "shell".to_string(),
+                        object!({}),
+                        Some("Approve A?".to_string()),
+                    )),
+                    None,
+                )),
+                Ok((
+                    Some(Message::assistant().with_action_required(
+                        "permission-b",
+                        "shell".to_string(),
+                        object!({}),
+                        Some("Approve B?".to_string()),
+                    )),
+                    None,
+                )),
+                Ok((
+                    Some(
+                        Message::assistant()
+                            .with_id("provider-id")
+                            .with_text("done"),
+                    ),
+                    None,
+                )),
+                Ok((Some(Message::assistant().with_text("next")), None)),
+                Ok((Some(Message::assistant().with_text("a")), None)),
+                Ok((
+                    Some(Message::assistant().with_tool_request(
+                        "tool-t",
+                        Ok(rmcp::model::CallToolRequestParams::new("test_tool")),
+                    )),
+                    None,
+                )),
+                Ok((Some(Message::assistant().with_text("b")), None)),
+            ]
+                as Vec<StreamItem>)))
+        }
+    }
+
+    #[tokio::test]
+    async fn normal_provider_stream_groups_only_contiguous_mergeable_chunks() -> anyhow::Result<()>
+    {
+        let provider = Arc::new(MixedMessageIdStreamProvider);
+        let mut stream = stream_response_from_provider(
+            provider,
+            ModelConfig::new("test-model"),
+            "test-session",
+            "system",
+            &[Message::user().with_text("hi")],
+            &[],
+            &[],
+        )
+        .await?;
+
+        let mut messages = Vec::new();
+        while let Some(item) = stream.next().await {
+            let (message, usage) = item?;
+            assert!(usage.is_none());
+            if let Some(message) = message {
+                messages.push(message);
+            }
+        }
+
+        assert_eq!(messages.len(), 9);
+
+        let ids = messages
+            .iter()
+            .map(|message| {
+                message
+                    .id
+                    .as_deref()
+                    .expect("streamed provider message should have an ID")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(messages[0].as_concat_text(), "Hel");
+        assert_eq!(messages[1].as_concat_text(), "lo");
+        assert_eq!(ids[0], ids[1]);
+        assert!(ids[0].starts_with("msg_"));
+
+        assert!(matches!(
+            messages[2].content.first(),
+            Some(MessageContent::ActionRequired(_))
+        ));
+        assert!(matches!(
+            messages[3].content.first(),
+            Some(MessageContent::ActionRequired(_))
+        ));
+        assert_ne!(ids[2], ids[3]);
+        assert_ne!(ids[2], ids[0]);
+        assert_ne!(ids[3], ids[0]);
+
+        assert_eq!(messages[4].as_concat_text(), "done");
+        assert_eq!(ids[4], "provider-id");
+
+        assert_eq!(messages[5].as_concat_text(), "next");
+        assert_eq!(messages[6].as_concat_text(), "a");
+        assert_ne!(ids[5], ids[0]);
+        assert_eq!(ids[5], ids[6]);
+
+        assert!(matches!(
+            messages[7].content.first(),
+            Some(MessageContent::ToolRequest(_))
+        ));
+        assert_ne!(ids[7], ids[5]);
+
+        assert_eq!(messages[8].as_concat_text(), "b");
+        assert_ne!(ids[8], ids[5]);
+        assert_ne!(ids[8], ids[7]);
+
+        Ok(())
+    }
+
+    struct ToolshimMessageIdProvider {
+        messages: Vec<Message>,
+    }
+
+    #[async_trait]
+    impl Provider for ToolshimMessageIdProvider {
+        fn get_name(&self) -> &str {
+            "toolshim-message-id"
+        }
+
+        async fn stream(
+            &self,
+            _model_config: &ModelConfig,
+            _system: &str,
+            _messages: &[Message],
+            _tools: &[Tool],
+        ) -> Result<MessageStream, ProviderError> {
+            type StreamItem = Result<(Option<Message>, Option<ProviderUsage>), ProviderError>;
+            let items = self
+                .messages
+                .iter()
+                .cloned()
+                .map(|message| Ok((Some(message), None)))
+                .collect::<Vec<StreamItem>>();
+            Ok(Box::pin(futures::stream::iter(items)))
+        }
+    }
+
+    #[tokio::test]
+    async fn toolshim_provider_stream_assigns_missing_message_id() -> anyhow::Result<()> {
+        let provider = Arc::new(ToolshimMessageIdProvider {
+            messages: vec![
+                Message::assistant().with_text("Hel"),
+                Message::assistant().with_text("lo"),
+            ],
+        });
+        let mut stream = stream_response_from_provider(
+            provider,
+            ModelConfig::new("test-model").with_toolshim(true),
+            "test-session",
+            "system",
+            &[Message::user().with_text("hi")],
+            &[],
+            &[],
+        )
+        .await?;
+
+        let mut messages = Vec::new();
+        while let Some(item) = stream.next().await {
+            let (message, usage) = item?;
+            assert!(usage.is_none());
+            if let Some(message) = message {
+                messages.push(message);
+            }
+        }
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].as_concat_text(), "Hello");
+        let id = messages[0]
+            .id
+            .as_deref()
+            .expect("toolshim provider message should have an ID");
+        assert!(id.starts_with("msg_"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn toolshim_provider_stream_preserves_provider_message_id() -> anyhow::Result<()> {
+        let provider = Arc::new(ToolshimMessageIdProvider {
+            messages: vec![Message::assistant()
+                .with_id("provider-toolshim-id")
+                .with_text("hello")],
+        });
+        let mut stream = stream_response_from_provider(
+            provider,
+            ModelConfig::new("test-model").with_toolshim(true),
+            "test-session",
+            "system",
+            &[Message::user().with_text("hi")],
+            &[],
+            &[],
+        )
+        .await?;
+
+        let mut messages = Vec::new();
+        while let Some(item) = stream.next().await {
+            let (message, usage) = item?;
+            assert!(usage.is_none());
+            if let Some(message) = message {
+                messages.push(message);
+            }
+        }
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].as_concat_text(), "hello");
+        assert_eq!(messages[0].id.as_deref(), Some("provider-toolshim-id"));
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn categorize_tool_requests_keeps_thinking_when_not_previously_streamed() {
         let agent = crate::agents::Agent::new();
-        let response = Message::assistant()
+        let mut response = Message::assistant()
             .with_thinking("final-only reasoning", "")
             .with_tool_request(
                 "tool-1",
                 Ok(rmcp::model::CallToolRequestParams::new("test_tool")),
             );
+        response.metadata.output_token_limit_reached = true;
 
         let (_frontend_requests, other_requests, filtered_message) =
             agent.categorize_tool_requests(&response, &[], false).await;
 
         assert_eq!(other_requests.len(), 1);
+        assert!(filtered_message.metadata.output_token_limit_reached);
         assert_eq!(filtered_message.content.len(), 2);
         assert!(matches!(
             filtered_message.content[0],
@@ -1115,7 +1576,7 @@ mod tests {
         let agent = crate::agents::Agent::new();
 
         let registry_tool = Tool::new("test_tool", "a test tool", object!({ "type": "object" }))
-            .with_meta(rmcp::model::Meta(
+            .with_meta(rmcp::model::MetaObject(
                 serde_json::json!({ "ui": { "visibility": ["model"] } })
                     .as_object()
                     .unwrap()
@@ -1207,7 +1668,7 @@ mod tests {
         let mut tool = Tool::new("test_tool", "a test tool", object!({ "type": "object" }));
         if let Some(v) = meta_json {
             let obj = v.as_object().unwrap().clone();
-            tool = tool.with_meta(rmcp::model::Meta(obj));
+            tool = tool.with_meta(rmcp::model::MetaObject(obj));
         }
         tool
     }
@@ -1385,5 +1846,220 @@ mod tests {
             "no content chunk observed means no TTFT"
         );
         assert!(stats.elapsed_ms.expect("elapsed_ms must be filled") >= 100);
+    }
+
+    type TestStreamItem = Result<(Option<Message>, Option<ProviderUsage>), ProviderError>;
+
+    struct SequencedProvider {
+        responses: Mutex<std::collections::VecDeque<Result<Vec<TestStreamItem>, ProviderError>>>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        manages_context: bool,
+    }
+
+    impl SequencedProvider {
+        fn new(responses: Vec<Result<Vec<TestStreamItem>, ProviderError>>) -> Self {
+            Self {
+                responses: Mutex::new(responses.into()),
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                manages_context: false,
+            }
+        }
+
+        fn managing_context(mut self) -> Self {
+            self.manages_context = true;
+            self
+        }
+    }
+
+    #[async_trait]
+    impl Provider for SequencedProvider {
+        fn get_name(&self) -> &str {
+            "sequenced"
+        }
+
+        fn retry_config(&self) -> goose_providers::retry::RetryConfig {
+            goose_providers::retry::RetryConfig::new(2, 0, 1.0, 0)
+        }
+
+        fn manages_own_context(&self) -> bool {
+            self.manages_context
+        }
+
+        async fn stream(
+            &self,
+            _model_config: &ModelConfig,
+            _system: &str,
+            _messages: &[Message],
+            _tools: &[Tool],
+        ) -> Result<MessageStream, ProviderError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let response = self.responses.lock().unwrap().pop_front().unwrap();
+            response.map(|items| Box::pin(futures::stream::iter(items)) as MessageStream)
+        }
+    }
+
+    fn successful_item() -> TestStreamItem {
+        Ok((Some(Message::assistant().with_text("ok")), None))
+    }
+
+    fn transient_error() -> ProviderError {
+        ProviderError::NetworkError("stream closed".into())
+    }
+
+    async fn stream_for_test(provider: Arc<dyn Provider>) -> MessageStream {
+        stream_response_from_provider(
+            provider,
+            ModelConfig::new("test-model"),
+            "session",
+            "system",
+            &[Message::user().with_text("hi")],
+            &[],
+            &[],
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn first_item_transient_error_retries() {
+        let provider = Arc::new(SequencedProvider::new(vec![
+            Ok(vec![Err(transient_error())]),
+            Ok(vec![successful_item()]),
+        ]));
+        let calls = provider.calls.clone();
+        let mut stream = stream_for_test(provider).await;
+
+        assert_eq!(
+            stream
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .0
+                .unwrap()
+                .as_concat_text(),
+            "ok"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn first_item_non_transient_error_does_not_retry() {
+        let provider = Arc::new(SequencedProvider::new(vec![Ok(vec![Err(
+            ProviderError::ContextLengthExceeded("too long".into()),
+        )])]));
+        let calls = provider.calls.clone();
+        let mut stream = stream_for_test(provider).await;
+
+        assert!(matches!(
+            stream.next().await.unwrap(),
+            Err(ProviderError::ContextLengthExceeded(_))
+        ));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn first_item_retry_exhaustion_returns_last_error() {
+        let provider = Arc::new(SequencedProvider::new(vec![
+            Ok(vec![Err(transient_error())]),
+            Ok(vec![Err(transient_error())]),
+            Ok(vec![Err(transient_error())]),
+        ]));
+        let calls = provider.calls.clone();
+        let mut stream = stream_for_test(provider).await;
+
+        assert!(matches!(
+            stream.next().await.unwrap(),
+            Err(ProviderError::NetworkError(_))
+        ));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn provider_managing_context_does_not_retry() {
+        let provider = Arc::new(
+            SequencedProvider::new(vec![Ok(vec![Err(transient_error())])]).managing_context(),
+        );
+        let calls = provider.calls.clone();
+        let mut stream = stream_for_test(provider).await;
+
+        assert!(matches!(
+            stream.next().await.unwrap(),
+            Err(ProviderError::NetworkError(_))
+        ));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn replacement_stream_creation_error_does_not_retry() {
+        let provider = Arc::new(SequencedProvider::new(vec![
+            Ok(vec![Err(transient_error())]),
+            Err(ProviderError::ServerError("unavailable".into())),
+        ]));
+        let calls = provider.calls.clone();
+        let mut stream = stream_for_test(provider).await;
+
+        assert!(matches!(
+            stream.next().await.unwrap(),
+            Err(ProviderError::ServerError(_))
+        ));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn error_after_first_item_does_not_retry() {
+        let provider = Arc::new(SequencedProvider::new(vec![Ok(vec![
+            successful_item(),
+            Err(transient_error()),
+        ])]));
+        let calls = provider.calls.clone();
+        let mut stream = stream_for_test(provider).await;
+
+        assert!(stream.next().await.unwrap().is_ok());
+        assert!(matches!(
+            stream.next().await.unwrap(),
+            Err(ProviderError::NetworkError(_))
+        ));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn empty_stream_is_not_retried() {
+        let provider = Arc::new(SequencedProvider::new(vec![Ok(vec![])]));
+        let calls = provider.calls.clone();
+        let mut stream = stream_for_test(provider).await;
+
+        assert!(stream.next().await.is_none());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    struct PendingProvider;
+
+    #[async_trait]
+    impl Provider for PendingProvider {
+        fn get_name(&self) -> &str {
+            "pending"
+        }
+
+        async fn stream(
+            &self,
+            _model_config: &ModelConfig,
+            _system: &str,
+            _messages: &[Message],
+            _tools: &[Tool],
+        ) -> Result<MessageStream, ProviderError> {
+            Ok(Box::pin(futures::stream::pending()))
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_first_item_does_not_block_stream_creation() {
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            stream_for_test(Arc::new(PendingProvider)),
+        )
+        .await;
+
+        assert!(result.is_ok());
     }
 }

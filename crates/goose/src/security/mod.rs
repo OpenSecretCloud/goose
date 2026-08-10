@@ -1,6 +1,5 @@
 pub mod adversary_inspector;
 pub mod classification_client;
-pub mod command_chunker;
 pub mod egress_inspector;
 pub mod patterns;
 pub mod scanner;
@@ -25,6 +24,8 @@ pub(crate) fn get_override(env_key: &str) -> Option<bool> {
 
 pub struct SecurityManager {
     scanner: OnceLock<PromptInjectionScanner>,
+    #[cfg(test)]
+    enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -41,10 +42,26 @@ impl SecurityManager {
     pub fn new() -> Self {
         Self {
             scanner: OnceLock::new(),
+            #[cfg(test)]
+            enabled: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn enabled() -> Self {
+        Self {
+            scanner: OnceLock::new(),
+            enabled: Some(true),
         }
     }
 
     pub fn is_prompt_injection_detection_enabled(&self) -> bool {
+        #[cfg(test)]
+        {
+            if let Some(enabled) = self.enabled {
+                return enabled;
+            }
+        }
         if let Some(overridden) = get_override("SECURITY_PROMPT_ENABLED_OVERRIDE") {
             return overridden;
         }

@@ -47,6 +47,11 @@ on:
         required: false
         type: boolean
         default: false
+      environment:
+        description: 'GitHub Environment containing signing secrets. Leave empty for unsigned builds.'
+        required: false
+        type: string
+        default: ''
       ref:
         description: 'Git ref to checkout'
         required: false
@@ -67,7 +72,7 @@ jobs:
     runs-on: ${{ inputs.windows_variant == 'cuda' && 'windows-2022' || 'windows-latest' }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           ref: ${{ inputs.ref != '' && inputs.ref || '' }}
 
@@ -91,7 +96,7 @@ jobs:
 
       - name: Install CUDA toolkit
         if: ${{ inputs.windows_variant == 'cuda' }}
-        uses: Jimver/cuda-toolkit@3d45d157f327c09c04b50ee6ccdea2d9d017ec76  # v0.2.35
+        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d  # v0.2.36
         with:
           cuda: '12.9.1'
           method: 'local'
@@ -181,7 +186,7 @@ jobs:
     runs-on: ${{ inputs.windows_variant == 'cuda' && 'windows-2022' || 'windows-latest' }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           ref: ${{ inputs.ref != '' && inputs.ref || '' }}
 
@@ -284,7 +289,7 @@ jobs:
     needs: build-desktop-windows
     if: ${{ inputs.package_desktop && inputs.signing }}
     runs-on: windows-latest
-    environment: ${{ inputs.signing && 'signing' || null }}
+    environment: ${{ inputs.environment || '' }}
     permissions:
       id-token: write
     steps:
@@ -295,7 +300,7 @@ jobs:
           path: dist-windows
 
       - name: Azure login
-        uses: azure/login@532459ea530d8321f2fb9bb10d1e0bcf23869a43  # v3.0.0
+        uses: azure/login@f5d393ae46f8fde4be8b75f32e3fc50e654ad0ca  # v3.0.1
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}

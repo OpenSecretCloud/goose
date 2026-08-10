@@ -2,7 +2,6 @@ mod builder;
 mod completion;
 pub mod editor;
 mod elicitation;
-mod export;
 mod input;
 mod output;
 mod paste;
@@ -13,16 +12,18 @@ mod thinking;
 use crate::session::task_execution_display::{
     format_task_execution_notification, TASK_EXECUTION_NOTIFICATION_TYPE,
 };
-use goose::conversation::{fix_conversation, Conversation};
+use goose::conversation::{fix_conversation, merge_consecutive_messages_for_request, Conversation};
 use std::env;
 use std::io::Write;
 use std::str::FromStr;
 use tokio::signal::ctrl_c;
 use tokio_util::task::AbortOnDropHandle;
 
-pub use self::export::{message_to_markdown, user_projected_message_to_markdown};
 pub use builder::{build_session, SessionBuilderConfig};
 use console::Color;
+use goose::agents::platform_extensions::developer::shell::{
+    parse_shell_output_notification, ShellOutputNotificationParams, ShellOutputStream,
+};
 use goose::agents::AgentEvent;
 use goose::agents::SUBAGENT_TOOL_REQUEST_TYPE;
 use goose::permission::permission_confirmation::PrincipalType;
@@ -63,10 +64,21 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 const GOOSE_PLANNER_CONTEXT_LIMIT: &str = "GOOSE_PLANNER_CONTEXT_LIMIT";
+const SHELL_STATUS_FALLBACK_WIDTH: usize = 120;
+const SHELL_STATUS_MAX_LINES: usize = 3;
+const SHELL_STATUS_RESERVED_WIDTH: usize = 2;
 
 fn planner_provider_messages(plan_messages: &Conversation) -> Conversation {
-    let projected_messages = plan_messages.agent_visible_messages();
-    fix_conversation(Conversation::new_unvalidated(projected_messages)).0
+    // The planner prompt has no turn-context instructions; drop the blocks.
+    let projected_messages: Vec<Message> = plan_messages
+        .agent_visible_messages()
+        .into_iter()
+        .filter(|message| !message.is_turn_context())
+        .collect();
+    let fixed = fix_conversation(Conversation::new_unvalidated(projected_messages)).0;
+    Conversation::new_unvalidated(merge_consecutive_messages_for_request(
+        fixed.messages().clone(),
+    ))
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -523,6 +535,14 @@ impl CliSession {
 
     /// Start an interactive session, optionally with an initial message
     pub async fn interactive(&mut self, prompt: Option<String>) -> Result<()> {
+        let banners = self
+            .agent
+            .emit_hook_with_banners(goose::hooks::HookEvent::SessionStart, &self.session_id)
+            .await;
+        if !banners.is_empty() {
+            output::display_banner(&banners);
+        }
+
         let result = self.run_interactive(prompt).await;
 
         self.agent
@@ -665,6 +685,10 @@ impl CliSession {
                 history.save(editor);
                 self.handle_clear().await?;
             }
+            InputResult::New => {
+                history.save(editor);
+                self.handle_new().await?;
+            }
             InputResult::PromptCommand(opts) => {
                 history.save(editor);
                 self.handle_prompt_command(opts).await?;
@@ -730,16 +754,6 @@ impl CliSession {
             RunMode::Normal => {
                 history.save(editor);
                 self.push_message(Message::user().with_text(content));
-
-                if let Err(e) = crate::project_tracker::update_project_tracker(
-                    Some(content),
-                    Some(&self.session_id),
-                ) {
-                    eprintln!(
-                        "Warning: Failed to update project tracker with instruction: {}",
-                        e
-                    );
-                }
 
                 let _provider = self.agent.provider().await?;
 
@@ -1068,6 +1082,92 @@ impl CliSession {
             self.debug,
         );
         Ok(())
+    }
+
+    async fn handle_new(&mut self) -> Result<()> {
+        let provider = self.agent.provider().await?;
+        if provider.manages_own_context() {
+            output::render_error(&format!(
+                "Starting a new session is not supported for provider '{}' because it manages its own conversation context.",
+                provider.get_name()
+            ));
+            return Ok(());
+        }
+
+        let new_session_id = match self.prepare_successor_session().await {
+            Ok(id) => id,
+            Err(e) => {
+                output::render_error(&format!("Failed to start a new session: {}", e));
+                return Ok(());
+            }
+        };
+
+        let extension_configs = self.agent.get_extension_configs().await;
+
+        self.agent
+            .emit_hook(goose::hooks::HookEvent::SessionEnd, &self.session_id)
+            .await;
+
+        self.agent.discard_pending_steers(&self.session_id).await;
+
+        self.session_id = new_session_id;
+        self.messages.clear();
+        self.run_mode = RunMode::Normal;
+        self.agent.set_goal(None).await;
+        self.agent.set_grind(None).await;
+
+        if let Err(e) = self
+            .agent
+            .update_goose_mode(self.agent.goose_mode().await, &self.session_id)
+            .await
+        {
+            output::render_error(&format!("Failed to apply the current mode: {}", e));
+        }
+
+        if !extension_configs.is_empty() {
+            output::goose_mode_message("Restarting extensions for the new session...");
+        }
+
+        // MCP clients pin themselves to the first session id they see a request for, so
+        // extensions must be torn down and re-added under the new session id.
+        for name in self.agent.list_extensions().await {
+            if let Err(e) = self.agent.remove_extension(&name, &self.session_id).await {
+                output::render_extension_error(&name, &e.to_string());
+            }
+        }
+
+        let mut unavailable = Vec::new();
+        for config in extension_configs {
+            let name = config.name();
+            if let Err(e) = self.agent.add_extension(config, &self.session_id).await {
+                output::render_extension_error(&name, &e.to_string());
+                unavailable.push(name);
+            }
+        }
+
+        if let Err(e) = self.update_completion_cache().await {
+            output::render_error(&format!("Failed to refresh completions: {}", e));
+        }
+
+        let mut started = format!("Started a new session · {}\n", self.session_id);
+        if !unavailable.is_empty() {
+            started.push_str(&format!(
+                "Continuing without these extensions: {}\n",
+                unavailable.join(", ")
+            ));
+        }
+        output::render_message(&Message::assistant().with_text(started), self.debug);
+        Ok(())
+    }
+
+    async fn prepare_successor_session(&self) -> Result<String> {
+        let session_manager = &self.agent.config.session_manager;
+        let old_session = session_manager.get_session(&self.session_id, false).await?;
+        let new_session_id =
+            create_successor_session(session_manager, &old_session, self.agent.goose_mode().await)
+                .await?;
+        self.agent.persist_extension_state(&new_session_id).await?;
+        Ok(new_session_id)
     }
 
     async fn handle_recipe(&mut self, filepath_opt: Option<String>) {
@@ -1651,24 +1751,29 @@ impl CliSession {
                 &Message::assistant().with_text(interrupt_prompt),
                 self.debug,
             );
-        } else if let Some(last_msg) = self.messages.last() {
-            if last_msg.role == rmcp::model::Role::User {
-                match last_msg.content.first() {
-                    Some(MessageContent::ToolResponse(_)) => {
-                        self.push_message(Message::assistant().with_text(interrupt_prompt));
-                        output::render_message(
-                            &Message::assistant().with_text(interrupt_prompt),
-                            self.debug,
-                        );
-                    }
-                    Some(_) => {
-                        self.messages.pop();
-                        let assistant_msg = Message::assistant().with_text(interrupt_prompt);
-                        self.push_message(assistant_msg.clone());
-                        output::render_message(&assistant_msg, self.debug);
-                    }
-                    None => {
-                        // Empty message content — nothing to do, just continue gracefully
+        } else {
+            while self.messages.last().is_some_and(Message::is_turn_context) {
+                self.messages.pop();
+            }
+            if let Some(last_msg) = self.messages.last() {
+                if last_msg.role == rmcp::model::Role::User {
+                    match last_msg.content.first() {
+                        Some(MessageContent::ToolResponse(_)) => {
+                            self.push_message(Message::assistant().with_text(interrupt_prompt));
+                            output::render_message(
+                                &Message::assistant().with_text(interrupt_prompt),
+                                self.debug,
+                            );
+                        }
+                        Some(_) => {
+                            self.messages.pop();
+                            let assistant_msg = Message::assistant().with_text(interrupt_prompt);
+                            self.push_message(assistant_msg.clone());
+                            output::render_message(&assistant_msg, self.debug);
+                        }
+                        None => {
+                            // Empty message content — nothing to do, just continue gracefully
+                        }
                     }
                 }
             }
@@ -1972,6 +2077,40 @@ impl CliSession {
     }
 }
 
+async fn create_successor_session(
+    session_manager: &SessionManager,
+    old_session: &goose::session::Session,
+    goose_mode: GooseMode,
+) -> Result<String> {
+    let new_session = session_manager
+        .create_session(
+            old_session.working_dir.clone(),
+            "CLI Session".to_string(),
+            old_session.session_type,
+            goose_mode,
+        )
+        .await?;
+
+    let mut builder = session_manager
+        .update(&new_session.id)
+        .recipe(old_session.recipe.clone())
+        .user_recipe_values(old_session.user_recipe_values.clone());
+
+    if let Some(provider_name) = old_session.provider_name.clone() {
+        builder = builder.provider_name(provider_name);
+    }
+    if let Some(model_config) = old_session.model_config.clone() {
+        builder = builder.model_config(model_config);
+    }
+    if let Some(project_id) = old_session.project_id.clone() {
+        builder = builder.project_id(Some(project_id));
+    }
+
+    builder.apply().await?;
+
+    Ok(new_session.id)
+}
+
 fn message_has_text(message: &Message) -> bool {
     message.content.iter().any(
         |content| matches!(content, MessageContent::Text(text) if !text.text.trim().is_empty()),
@@ -2265,8 +2404,69 @@ fn handle_mcp_notification(
                 );
             }
         }
+        ServerNotification::CustomNotification(notification) => {
+            if let Some(params) = parse_shell_output_notification(notification) {
+                if is_stream_json_mode
+                    || is_json_mode
+                    || !interactive
+                    || !std::io::stdout().is_terminal()
+                {
+                    return;
+                }
+                display_shell_output_notification(params, progress_bars);
+            }
+        }
         _ => (),
     }
+}
+
+fn display_shell_output_notification(
+    params: ShellOutputNotificationParams,
+    progress_bars: &mut output::McpSpinners,
+) {
+    if params.truncated {
+        return;
+    }
+
+    let max_width = console::Term::stdout()
+        .size_checked()
+        .map(|(_, width)| usize::from(width).saturating_sub(SHELL_STATUS_RESERVED_WIDTH))
+        .unwrap_or(SHELL_STATUS_FALLBACK_WIDTH);
+    let lines = latest_shell_output_lines(&params, max_width)
+        .into_iter()
+        .map(|(stream, line)| match stream {
+            ShellOutputStream::Stdout => console::style(line).dim().to_string(),
+            ShellOutputStream::Stderr => console::style(line).yellow().dim().to_string(),
+        })
+        .collect::<Vec<_>>();
+    if !lines.is_empty() {
+        progress_bars.log_shell_output(lines, SHELL_STATUS_MAX_LINES);
+    }
+}
+
+fn latest_shell_output_lines(
+    params: &ShellOutputNotificationParams,
+    max_width: usize,
+) -> Vec<(ShellOutputStream, String)> {
+    let mut lines = params
+        .chunks
+        .iter()
+        .rev()
+        .flat_map(|chunk| {
+            chunk
+                .output
+                .lines()
+                .rev()
+                .map(move |line| (chunk.stream, line))
+        })
+        .take(SHELL_STATUS_MAX_LINES)
+        .map(|(stream, line)| {
+            let line = output::sanitize_terminal_line(line);
+            (stream, safe_truncate(&line, max_width))
+        })
+        .collect::<Vec<_>>();
+    lines.reverse();
+    lines
 }
 
 /// Format a logging notification from MCP, returns (formatted_message, subagent_id, notification_type)
@@ -2592,6 +2792,32 @@ mod tests {
     }
 
     #[test]
+    fn planner_history_excludes_turn_context_events() {
+        use goose::conversation::message::MessageMetadata;
+
+        let history = Conversation::new_unvalidated([
+            Message::user().with_text("plan the refactor"),
+            Message::user()
+                .with_text("<turn-context>cwd /repo, todo: ship v2</turn-context>")
+                .with_metadata(MessageMetadata::agent_only().with_turn_context()),
+            Message::assistant().with_text("on it"),
+        ]);
+
+        let provider_text = planner_provider_messages(&history)
+            .agent_visible_messages()
+            .iter()
+            .map(|message| message.as_concat_text())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(provider_text.contains("plan the refactor"));
+        assert!(
+            !provider_text.contains("turn-context"),
+            "the planner prompt has no turn-context instructions, so blocks must not reach it"
+        );
+    }
+
+    #[test]
     fn test_format_elapsed_time_under_60_seconds() {
         // Test sub-second duration
         let duration = Duration::from_millis(500);
@@ -2851,6 +3077,79 @@ mod tests {
         assert_eq!(
             CliSession::parse_streamable_http_extension(url, timeout),
             expected
+        );
+    }
+
+    #[tokio::test]
+    async fn new_session_inherits_provider_model_and_working_dir() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let sm = SessionManager::new(temp_dir.path().to_path_buf());
+
+        let old = sm
+            .create_session(
+                temp_dir.path().to_path_buf(),
+                "CLI Session".to_string(),
+                goose::session::SessionType::User,
+                GooseMode::Auto,
+            )
+            .await
+            .unwrap();
+
+        sm.update(&old.id)
+            .provider_name("anthropic")
+            .model_config(goose_providers::model::ModelConfig::new("test-model"))
+            .accumulated_usage(goose_providers::conversation::token_usage::Usage::new(
+                Some(100),
+                Some(50),
+                Some(150),
+            ))
+            .apply()
+            .await
+            .unwrap();
+
+        sm.add_message(&old.id, &Message::user().with_text("hello"))
+            .await
+            .unwrap();
+
+        let mut extension_data = goose::session::ExtensionData::new();
+        extension_data.set_extension_state("test", "v0", serde_json::json!("marker"));
+        sm.update(&old.id)
+            .extension_data(extension_data)
+            .apply()
+            .await
+            .unwrap();
+
+        let old = sm.get_session(&old.id, false).await.unwrap();
+
+        let new_id = create_successor_session(&sm, &old, GooseMode::Chat)
+            .await
+            .unwrap();
+
+        assert_ne!(new_id, old.id);
+
+        let new_session = sm.get_session(&new_id, true).await.unwrap();
+        assert_eq!(new_session.provider_name, old.provider_name);
+        assert_eq!(
+            new_session.model_config.as_ref().map(|m| &m.model_name),
+            old.model_config.as_ref().map(|m| &m.model_name)
+        );
+        assert_eq!(new_session.goose_mode, GooseMode::Chat);
+        assert_eq!(new_session.working_dir, old.working_dir);
+        assert_eq!(new_session.session_type, old.session_type);
+        assert!(new_session.conversation.unwrap().messages().is_empty());
+        assert_eq!(new_session.usage.total_tokens, None);
+        assert_eq!(old.accumulated_usage.total_tokens, Some(150));
+        assert_eq!(new_session.accumulated_usage.total_tokens, None);
+
+        let reloaded_old = sm.get_session(&old.id, true).await.unwrap();
+        let old_messages = reloaded_old.conversation.unwrap().messages().to_vec();
+        assert_eq!(old_messages.len(), 1);
+        assert_eq!(old_messages[0].as_concat_text(), "hello");
+        assert_eq!(
+            reloaded_old
+                .extension_data
+                .get_extension_state("test", "v0"),
+            Some(&serde_json::json!("marker"))
         );
     }
 }

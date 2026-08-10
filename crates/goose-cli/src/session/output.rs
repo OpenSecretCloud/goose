@@ -1,4 +1,4 @@
-use anstream::println;
+use anstream::{adapter::strip_str, println};
 use bat::WrappingMode;
 use console::{measure_text_width, style, Color, StyledObject, Term};
 use goose::config::Config;
@@ -12,10 +12,10 @@ use goose::subprocess::SubprocessExt;
 use goose::utils::safe_truncate;
 use goose_providers::conversation::token_usage::Usage;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use rmcp::model::{CallToolRequestParams, JsonObject, PromptArgument};
+use rmcp::model::{CallToolRequestParams, JsonObject, PromptArgument, Role};
 use serde_json::Value;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Display;
 use std::io::{Error, IsTerminal, Write};
 use std::path::Path;
@@ -26,6 +26,8 @@ use super::streaming_buffer::MarkdownBuffer;
 pub const DEFAULT_MIN_PRIORITY: f32 = 0.0;
 pub const DEFAULT_CLI_LIGHT_THEME: &str = "GitHub";
 pub const DEFAULT_CLI_DARK_THEME: &str = "zenburn";
+const OUTPUT_TOKEN_LIMIT_WARNING: &str =
+    "Warning: Response reached the model's output-token limit and may be incomplete.";
 
 fn accent<T: Display>(value: T) -> StyledObject<T> {
     style(value).cyan()
@@ -255,6 +257,9 @@ pub fn render_message(message: &Message, debug: bool) {
                 ActionRequiredData::ElicitationResponse { id, .. } => {
                     println!("action_required(elicitation_response): {}", id)
                 }
+                ActionRequiredData::ToolConfirmationResponse { id, .. } => {
+                    println!("action_required(tool_confirmation_response): {}", id)
+                }
             },
             MessageContent::Text(text) => print_markdown(&text.text, theme),
             MessageContent::ToolRequest(req) => render_tool_request(req, theme, debug),
@@ -283,12 +288,19 @@ pub fn render_message(message: &Message, debug: bool) {
                     }
                 }
             }
+            MessageContent::Error(error) => {
+                hide_thinking();
+                println!("\n{} {}", danger("error:").bold(), &error.message);
+            }
             _ => {
                 eprintln!("WARNING: Message content type could not be rendered");
             }
         }
     }
 
+    if reached_output_token_limit(&message) {
+        render_output_token_limit_warning();
+    }
     let _ = std::io::stdout().flush();
 }
 
@@ -340,6 +352,9 @@ pub fn render_message_streaming(
                     ActionRequiredData::ElicitationResponse { id, .. } => {
                         println!("action_required(elicitation_response): {}", id)
                     }
+                    ActionRequiredData::ToolConfirmationResponse { id, .. } => {
+                        println!("action_required(tool_confirmation_response): {}", id)
+                    }
                 }
             }
             MessageContent::Image(image) => {
@@ -372,6 +387,11 @@ pub fn render_message_streaming(
                     }
                 }
             }
+            MessageContent::Error(error) => {
+                flush_markdown_buffer(buffer, theme);
+                hide_thinking();
+                println!("\n{} {}", danger("error:").bold(), &error.message);
+            }
             _ => {
                 flush_markdown_buffer(buffer, theme);
                 eprintln!("WARNING: Message content type could not be rendered");
@@ -379,7 +399,19 @@ pub fn render_message_streaming(
         }
     }
 
+    if reached_output_token_limit(&message) {
+        flush_markdown_buffer(buffer, theme);
+        render_output_token_limit_warning();
+    }
     let _ = std::io::stdout().flush();
+}
+
+fn reached_output_token_limit(message: &Message) -> bool {
+    message.role == Role::Assistant && message.metadata.output_token_limit_reached
+}
+
+fn render_output_token_limit_warning() {
+    println!("\n{}", warning(OUTPUT_TOKEN_LIMIT_WARNING));
 }
 
 fn render_credits_exhausted_notification(notification: &SystemNotificationContent) {
@@ -559,6 +591,17 @@ fn render_tool_response(resp: &ToolResponse, debug: bool) {
     }
 }
 
+pub(super) fn sanitize_terminal_line(line: &str) -> String {
+    strip_str(line)
+        .flat_map(str::chars)
+        .filter(|character| *character == '\t' || !character.is_control())
+        .collect()
+}
+
+fn print_tool_output_line(line: &str) {
+    println!("    {}", style(sanitize_terminal_line(line)).dim());
+}
+
 fn print_tool_output(text: &str) {
     if text.is_empty() {
         return;
@@ -575,13 +618,13 @@ fn print_tool_output(text: &str) {
     let lines: Vec<&str> = text.lines().collect();
     if lines.len() <= max_lines {
         for line in &lines {
-            println!("    {}", style(line).dim());
+            print_tool_output_line(line);
         }
     } else {
         let head = max_lines / 2;
         let tail = max_lines - head;
         for line in &lines[..head] {
-            println!("    {}", style(line).dim());
+            print_tool_output_line(line);
         }
         println!(
             "    {}",
@@ -593,7 +636,7 @@ fn print_tool_output(text: &str) {
             .italic()
         );
         for line in &lines[lines.len() - tail..] {
-            println!("    {}", style(line).dim());
+            print_tool_output_line(line);
         }
     }
 }
@@ -991,15 +1034,29 @@ fn print_markdown(content: &str, theme: Theme) {
 }
 
 /// Renders markdown content using bat (no table processing)
+///
+/// The printer is cached per thread because `PrettyPrinter::new()`
+/// deserializes bat's bundled syntax/theme assets; `print()` drains the
+/// queued inputs but leaves the printer reusable.
 fn print_markdown_raw(content: &str, theme: Theme) {
-    bat::PrettyPrinter::new()
-        .input(bat::Input::from_bytes(content.as_bytes()))
-        .theme(theme.as_str())
-        .colored_output(env_no_color())
-        .language("Markdown")
-        .wrapping_mode(WrappingMode::NoWrapping(true))
-        .print()
-        .unwrap();
+    use std::cell::RefCell;
+    thread_local! {
+        static PRINTER: RefCell<bat::PrettyPrinter<'static>> =
+            RefCell::new(bat::PrettyPrinter::new());
+    }
+    PRINTER.with(|printer| {
+        printer
+            .borrow_mut()
+            .input(bat::Input::from_reader(Box::new(std::io::Cursor::new(
+                content.as_bytes().to_vec(),
+            ))))
+            .theme(theme.as_str())
+            .colored_output(env_no_color())
+            .language("Markdown")
+            .wrapping_mode(WrappingMode::NoWrapping(true))
+            .print()
+            .unwrap();
+    });
 }
 
 fn extract_markdown_table(content: &str) -> Option<(String, Vec<&str>, &str)> {
@@ -1378,6 +1435,14 @@ fn set_terminal_title() {
     let _ = std::io::stdout().flush();
 }
 
+pub fn display_banner(banners: &[String]) {
+    for banner in banners {
+        for line in banner.lines() {
+            println!("{}", line);
+        }
+    }
+}
+
 pub fn display_context_usage(total_tokens: usize, context_limit: usize) {
     use console::style;
 
@@ -1463,7 +1528,7 @@ pub fn display_cost_usage(provider: &str, model: &str, usage: &Usage) {
 pub struct McpSpinners {
     bars: HashMap<String, ProgressBar>,
     log_spinner: Option<ProgressBar>,
-
+    shell_output_lines: VecDeque<String>,
     multi_bar: MultiProgress,
 }
 
@@ -1472,6 +1537,7 @@ impl McpSpinners {
         McpSpinners {
             bars: HashMap::new(),
             log_spinner: None,
+            shell_output_lines: VecDeque::new(),
             multi_bar: MultiProgress::new(),
         }
     }
@@ -1492,6 +1558,13 @@ impl McpSpinners {
         });
 
         spinner.set_message(message.to_string());
+    }
+
+    pub fn log_shell_output(&mut self, lines: Vec<String>, max_lines: usize) {
+        let message = update_recent_lines(&mut self.shell_output_lines, lines, max_lines);
+        if !message.is_empty() {
+            self.log(&message);
+        }
     }
 
     pub fn update(&mut self, token: &str, value: f64, total: Option<f64>, message: Option<&str>) {
@@ -1520,8 +1593,25 @@ impl McpSpinners {
         if let Some(spinner) = self.log_spinner.as_mut() {
             spinner.disable_steady_tick();
         }
+        self.shell_output_lines.clear();
         self.multi_bar.clear()
     }
+}
+
+fn update_recent_lines(
+    recent_lines: &mut VecDeque<String>,
+    lines: impl IntoIterator<Item = String>,
+    max_lines: usize,
+) -> String {
+    recent_lines.extend(lines);
+    while recent_lines.len() > max_lines {
+        recent_lines.pop_front();
+    }
+    recent_lines
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join("\n  ")
 }
 
 #[cfg(test)]
@@ -1529,6 +1619,42 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::env;
+
+    #[test]
+    fn recent_lines_accumulate_across_updates() {
+        let mut recent_lines = VecDeque::new();
+        let mut rendered = String::new();
+
+        for line in ["one", "two", "three", "four"] {
+            rendered = update_recent_lines(&mut recent_lines, [line.to_string()], 3);
+        }
+
+        assert_eq!(rendered, "two\n  three\n  four");
+    }
+
+    #[test]
+    fn terminal_line_sanitizer_removes_escape_sequences_and_controls() {
+        assert_eq!(
+            sanitize_terminal_line(
+                "\x1b[31mred\x1b[0m \x1b[2J\x1b[H\
+                 \x1b]0;spoofed title\x07\
+                 \x1b]52;c;Y2xpcGJvYXJk\x1b\\safe"
+            ),
+            "red safe"
+        );
+        assert_eq!(
+            sanitize_terminal_line("before\x08after\x07\r\tvisible"),
+            "beforeafter\tvisible"
+        );
+    }
+
+    #[test]
+    fn terminal_line_sanitizer_preserves_plain_unicode_text() {
+        assert_eq!(
+            sanitize_terminal_line("goose 🪿\t日本語"),
+            "goose 🪿\t日本語"
+        );
+    }
 
     #[test]
     fn formats_subagent_tool_call_names() {

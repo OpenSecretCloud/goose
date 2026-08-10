@@ -233,6 +233,7 @@ impl McpClientTrait for AnalyzeClient {
             tools: vec![tool],
             next_cursor: None,
             meta: None,
+            ..Default::default()
         })
     }
 
@@ -278,6 +279,7 @@ mod tests {
         PlatformExtensionContext {
             extension_manager: None,
             session_manager: Arc::new(SessionManager::new(std::env::temp_dir())),
+            scheduler: None,
             session: None,
             use_login_shell_path: false,
         }

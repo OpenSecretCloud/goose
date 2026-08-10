@@ -560,6 +560,7 @@ impl McpClientTrait for CodeExecutionClient {
             meta: None,
             next_cursor: None,
             tools,
+            ..Default::default()
         })
     }
 
@@ -906,6 +907,7 @@ mod tests {
                 session_manager: Arc::new(crate::session::SessionManager::new(
                     temp.path().join("sessions"),
                 )),
+                scheduler: None,
                 session: None,
                 use_login_shell_path: false,
             },
