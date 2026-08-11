@@ -1920,6 +1920,13 @@ impl ExtensionManager {
             };
 
         let fut = async move {
+            if cancellation_token.is_cancelled() {
+                return Err(ErrorData::new(
+                    ErrorCode::INTERNAL_ERROR,
+                    "Tool call cancelled before execution".to_string(),
+                    None,
+                ));
+            }
             tracing::debug!(
                 "dispatch_tool_call: calling client.call_tool tool={} session_id={} working_dir={:?}",
                 actual_tool_name,
@@ -2193,6 +2200,7 @@ mod tests {
     use rmcp::model::ListToolsResult;
     use rmcp::model::ReadResourceResult;
     use rmcp::model::ServerNotification;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use tokio::sync::mpsc;
 
@@ -2334,6 +2342,39 @@ mod tests {
 
         async fn subscribe(&self) -> mpsc::Receiver<ServerNotification> {
             mpsc::channel(1).1
+        }
+    }
+
+    struct CountingClient {
+        call_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl McpClientTrait for CountingClient {
+        fn get_info(&self) -> Option<&InitializeResult> {
+            None
+        }
+
+        async fn list_tools(
+            &self,
+            session_id: &str,
+            next_cursor: Option<String>,
+            cancellation_token: CancellationToken,
+        ) -> Result<ListToolsResult, Error> {
+            MockClient {}
+                .list_tools(session_id, next_cursor, cancellation_token)
+                .await
+        }
+
+        async fn call_tool(
+            &self,
+            _ctx: &ToolCallContext,
+            _name: &str,
+            _arguments: Option<JsonObject>,
+            _cancellation_token: CancellationToken,
+        ) -> Result<CallToolResult, Error> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            Ok(CallToolResult::success(vec![]))
         }
     }
 
@@ -2577,6 +2618,45 @@ mod tests {
         } else {
             panic!("Expected ErrorData with ErrorCode::RESOURCE_NOT_FOUND");
         }
+    }
+
+    #[tokio::test]
+    async fn cancelled_deferred_dispatch_never_calls_the_client() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let extension_manager =
+            ExtensionManager::new_without_provider(temp_dir.path().to_path_buf());
+        let call_count = Arc::new(AtomicUsize::new(0));
+        extension_manager
+            .add_mock_extension(
+                "counting".to_string(),
+                Arc::new(CountingClient {
+                    call_count: Arc::clone(&call_count),
+                }),
+            )
+            .await;
+        let cancellation = CancellationToken::new();
+        let dispatched = extension_manager
+            .dispatch_tool_call(
+                &ToolCallContext::new(
+                    "test-session-id".to_string(),
+                    None,
+                    Some("test-request-id".to_string()),
+                ),
+                CallToolRequestParams::new("counting__tool".to_string()),
+                cancellation.clone(),
+            )
+            .await
+            .expect("dispatch should return its deferred result");
+
+        cancellation.cancel();
+        let error = dispatched
+            .result
+            .await
+            .expect_err("a cancelled deferred result must not reach the client");
+
+        assert_eq!(error.code, ErrorCode::INTERNAL_ERROR);
+        assert!(error.message.contains("cancelled before execution"));
+        assert_eq!(call_count.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

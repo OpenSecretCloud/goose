@@ -5,7 +5,9 @@ use std::collections::{HashMap, HashSet};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use futures::{FutureExt, StreamExt};
-use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock, ErrorData, Role, Tool};
+use rmcp::model::{
+    CallToolRequestParams, CallToolResult, ContentBlock, ErrorCode, ErrorData, Role, Tool,
+};
 
 use crate::agents::extension_manager::ExtensionManager;
 use crate::agents::platform_extensions::MANAGE_EXTENSIONS_TOOL_NAME_COMPLETE;
@@ -14,12 +16,12 @@ use crate::agents::state_machine::operation::{
     OperationResult, SlashCommand, StateEffect,
 };
 use crate::agents::state_machine::ops_tool_approval::request_executable;
-use crate::agents::tool_execution::{
-    tool_stream, ToolCallResult, ToolStreamItem, CHAT_MODE_TOOL_SKIPPED_RESPONSE, DECLINED_RESPONSE,
-};
+use crate::agents::tool_execution::{tool_stream, ToolCallResult, ToolStreamItem};
 use crate::agents::AgentEvent;
 use crate::config::GooseMode;
-use crate::conversation::message::{ActionRequiredData, Message, MessageContent, ToolRequest};
+use crate::conversation::message::{
+    ActionRequiredData, Message, MessageContent, ToolRequest, ToolResponseProvenance,
+};
 use crate::conversation::Conversation;
 use crate::hints::load_hints::SubdirectoryHintTracker;
 use crate::hooks::{HookContext, HookDecision, HookEvent, HookManager};
@@ -66,6 +68,14 @@ fn platform_notification(result: &CallToolResult) -> Option<rmcp::model::ServerN
             notification.get("params").cloned(),
         ),
     ))
+}
+
+fn cancelled_tool_call_error() -> ErrorData {
+    ErrorData::new(
+        ErrorCode::INTERNAL_ERROR,
+        "Tool call cancelled before execution".to_string(),
+        None,
+    )
 }
 
 pub(super) fn tool_span(tool_name: &str, tool_call_id: &str, session_id: &str) -> tracing::Span {
@@ -222,6 +232,9 @@ impl<'a> ToolExecutionOperation<'a> {
         cancellation_token: CancellationToken,
         session: &Session,
     ) -> std::result::Result<ToolCallResult, ErrorData> {
+        if cancellation_token.is_cancelled() {
+            return Err(cancelled_tool_call_error());
+        }
         let span = tool_span(&tool_call.name, &request_id, &session.id);
         let result_span = span.clone();
 
@@ -250,8 +263,15 @@ impl<'a> ToolExecutionOperation<'a> {
                     ));
                 }
             }
+            if cancellation_token.is_cancelled() {
+                return Err(cancelled_tool_call_error());
+            }
             self.emit_extended_pre_hooks(&tool_call.name, tool_input.as_ref(), session)
                 .await;
+
+            if cancellation_token.is_cancelled() {
+                return Err(cancelled_tool_call_error());
+            }
 
             let context = crate::agents::tool_execution::ToolCallContext::new(
                 session.id.clone(),
@@ -543,7 +563,13 @@ pub(super) fn pending_tool_requests(messages: &[Message]) -> Vec<(ToolRequest, T
                             {
                                 None
                             } else {
-                                Some((req.clone(), ToolDisposition::Decline))
+                                let provenance = match approvals.get(&req.id) {
+                                    Some(crate::permission::Permission::Cancel) => {
+                                        ToolResponseProvenance::GooseCancelledBeforeExecution
+                                    }
+                                    _ => ToolResponseProvenance::GooseDeniedBeforeExecution,
+                                };
+                                Some((req.clone(), ToolDisposition::Decline(provenance)))
                             }
                         }
                     }
@@ -557,7 +583,7 @@ pub(super) fn pending_tool_requests(messages: &[Message]) -> Vec<(ToolRequest, T
 #[derive(Clone, Eq, PartialEq)]
 pub(super) enum ToolDisposition {
     Execute,
-    Decline,
+    Decline(ToolResponseProvenance),
     ParseError(String),
 }
 
@@ -704,21 +730,31 @@ impl Operation for ToolExecutionOperation<'_> {
         if *self.goose_mode.lock().await == GooseMode::Chat {
             let mut response = Message::user();
             for (request, disposition) in &pending {
-                let result = match disposition {
+                match disposition {
                     ToolDisposition::ParseError(parse_error) => {
-                        CallToolResult::error(vec![ContentBlock::text(format!(
-                            "The tool call could not be parsed: {parse_error}."
-                        ))])
+                        response.add_tool_response_with_metadata(
+                            request.id.clone(),
+                            Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                                "The tool call could not be parsed: {parse_error}."
+                            ))])),
+                            request.metadata.as_ref(),
+                        );
                     }
-                    _ => CallToolResult::success(vec![ContentBlock::text(
-                        CHAT_MODE_TOOL_SKIPPED_RESPONSE,
-                    )]),
-                };
-                response.add_tool_response_with_metadata(
-                    request.id.clone(),
-                    Ok(result),
-                    request.metadata.as_ref(),
-                );
+                    ToolDisposition::Decline(provenance) => {
+                        response.add_goose_control_tool_response_with_metadata(
+                            request.id.clone(),
+                            *provenance,
+                            request.metadata.as_ref(),
+                        );
+                    }
+                    ToolDisposition::Execute => {
+                        response.add_goose_control_tool_response_with_metadata(
+                            request.id.clone(),
+                            ToolResponseProvenance::GooseSkippedInChatMode,
+                            request.metadata.as_ref(),
+                        );
+                    }
+                }
             }
             let response = emit.message(response).await;
             return applied([response.into()]);
@@ -774,12 +810,10 @@ impl Operation for ToolExecutionOperation<'_> {
         for (request, disposition) in &pending {
             match disposition {
                 ToolDisposition::Execute => {}
-                ToolDisposition::Decline => {
-                    response.add_tool_response_with_metadata(
+                ToolDisposition::Decline(provenance) => {
+                    response.add_goose_control_tool_response_with_metadata(
                         request.id.clone(),
-                        Ok(CallToolResult::error(vec![ContentBlock::text(
-                            DECLINED_RESPONSE,
-                        )])),
+                        *provenance,
                         request.metadata.as_ref(),
                     );
                 }
@@ -800,6 +834,9 @@ impl Operation for ToolExecutionOperation<'_> {
             tokio::select! {
                 biased;
                 item = combined.next() => {
+                    if emit.cancel_token().is_cancelled() {
+                        break;
+                    }
                     let Some((request_id, item)) = item else { break };
                     match item {
                         ToolStreamItem::Result(output) => {
@@ -844,11 +881,9 @@ impl Operation for ToolExecutionOperation<'_> {
             .collect();
         for request in &requests {
             if !answered.contains(request.id.as_str()) {
-                response.add_tool_response_with_metadata(
+                response.add_goose_control_tool_response_with_metadata(
                     request.id.clone(),
-                    Ok(CallToolResult::error(vec![ContentBlock::text(
-                        "Tool call was interrupted before completing",
-                    )])),
+                    ToolResponseProvenance::GooseInterruptedUnknownCompletion,
                     request.metadata.as_ref(),
                 );
             }

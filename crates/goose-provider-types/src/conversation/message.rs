@@ -83,6 +83,22 @@ where
 pub type ProviderMetadata = serde_json::Map<String, serde_json::Value>;
 pub type ToolResult<T> = Result<T, rmcp::model::ErrorData>;
 
+pub const DECLINED_RESPONSE: &str = "The user has declined to run this tool. \
+    DO NOT attempt to call this tool again. \
+    If there are no alternative methods to proceed, clearly explain the situation and STOP.";
+pub const CANCELLED_RESPONSE: &str = "Tool call was cancelled before execution.";
+pub const INTERRUPTED_RESPONSE: &str =
+    "Tool call was interrupted; whether it completed is unknown. Verify its effects before retrying.";
+pub const CHAT_MODE_TOOL_SKIPPED_RESPONSE: &str =
+    "Let the user know the tool call was skipped in goose chat mode. \
+     DO NOT apologize for skipping the tool call. DO NOT say sorry. \
+     Provide an explanation of what the tool call would do, structured as a \
+     plan for the user. Again, DO NOT apologize. \
+     **Example Plan:**\n \
+     1. **Identify Task Scope** - Determine the purpose and expected outcome.\n \
+     2. **Outline Steps** - Break down the steps.\n \
+     If needed, adjust the explanation based on user preferences or questions.";
+
 pub(crate) fn sanitize_tool_result_in_place(tool_result: &mut ToolResult<CallToolResult>) {
     match tool_result {
         Ok(result) => {
@@ -174,6 +190,62 @@ pub struct ToolResponse {
     pub tool_result: ToolResult<CallToolResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<ProviderMetadata>,
+    #[serde(
+        default,
+        skip_serializing_if = "ToolResponseProvenance::is_untrusted_tool"
+    )]
+    pub provenance: ToolResponseProvenance,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolResponseProvenance {
+    #[default]
+    UntrustedTool,
+    GooseDeniedBeforeExecution,
+    GooseCancelledBeforeExecution,
+    GooseInterruptedUnknownCompletion,
+    GooseSkippedInChatMode,
+}
+
+impl ToolResponseProvenance {
+    pub fn is_untrusted_tool(&self) -> bool {
+        *self == Self::UntrustedTool
+    }
+
+    fn canonical_control_spec(self) -> Option<(&'static str, bool)> {
+        match self {
+            Self::UntrustedTool => None,
+            Self::GooseDeniedBeforeExecution => Some((DECLINED_RESPONSE, true)),
+            Self::GooseCancelledBeforeExecution => Some((CANCELLED_RESPONSE, true)),
+            Self::GooseInterruptedUnknownCompletion => Some((INTERRUPTED_RESPONSE, true)),
+            Self::GooseSkippedInChatMode => Some((CHAT_MODE_TOOL_SKIPPED_RESPONSE, false)),
+        }
+    }
+}
+
+impl ToolResponse {
+    pub fn is_canonical_goose_control_response(&self) -> bool {
+        let Some((expected_text, expected_is_error)) = self.provenance.canonical_control_spec()
+        else {
+            return false;
+        };
+        let Ok(result) = &self.tool_result else {
+            return false;
+        };
+        if result.is_error != Some(expected_is_error)
+            || result.structured_content.is_some()
+            || result.meta.is_some()
+            || result.content.len() != 1
+        {
+            return false;
+        }
+        matches!(
+            result.content.first(),
+            Some(ContentBlock::Text(text))
+                if text.text == expected_text && text.annotations.is_none()
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -420,6 +492,7 @@ impl MessageContentBlock {
                     id: res.id.clone(),
                     tool_result: Ok(tool_result),
                     metadata: res.metadata.clone(),
+                    provenance: res.provenance,
                 }))
             }
             MessageContentBlock::Thinking(_) | MessageContentBlock::RedactedThinking(_) => {
@@ -476,6 +549,7 @@ impl MessageContentBlock {
             id: id.into(),
             tool_result: sanitize_tool_result(tool_result),
             metadata: None,
+            provenance: ToolResponseProvenance::UntrustedTool,
         })
     }
 
@@ -488,6 +562,28 @@ impl MessageContentBlock {
             id: id.into(),
             tool_result: sanitize_tool_result(tool_result),
             metadata: metadata.cloned(),
+            provenance: ToolResponseProvenance::UntrustedTool,
+        })
+    }
+
+    pub fn goose_control_tool_response_with_metadata<S: Into<String>>(
+        id: S,
+        provenance: ToolResponseProvenance,
+        metadata: Option<&ProviderMetadata>,
+    ) -> Self {
+        let (text, is_error) = provenance
+            .canonical_control_spec()
+            .expect("Goose control responses require a control provenance");
+        let tool_result = if is_error {
+            CallToolResult::error(vec![ContentBlock::text(text)])
+        } else {
+            CallToolResult::success(vec![ContentBlock::text(text)])
+        };
+        MessageContentBlock::ToolResponse(ToolResponse {
+            id: id.into(),
+            tool_result: Ok(tool_result),
+            metadata: metadata.cloned(),
+            provenance,
         })
     }
 
@@ -1084,6 +1180,19 @@ impl Message {
             ));
     }
 
+    pub fn add_goose_control_tool_response_with_metadata<S: Into<String>>(
+        &mut self,
+        id: S,
+        provenance: ToolResponseProvenance,
+        metadata: Option<&ProviderMetadata>,
+    ) {
+        self.content.push(
+            MessageContentBlock::goose_control_tool_response_with_metadata(
+                id, provenance, metadata,
+            ),
+        );
+    }
+
     /// Add an action required message for tool confirmation
     pub fn with_action_required<S: Into<String>>(
         self,
@@ -1321,7 +1430,7 @@ pub struct TokenState {
 mod tests {
     use crate::conversation::message::{
         ActionRequiredData, Message, MessageContentBlock, MessageMetadata, ProviderMetadata,
-        ToolResponse,
+        ToolResponse, ToolResponseProvenance, CHAT_MODE_TOOL_SKIPPED_RESPONSE, DECLINED_RESPONSE,
     };
     use base64::Engine;
     use rmcp::model::{
@@ -1363,6 +1472,81 @@ mod tests {
             panic!("expected text content");
         };
         assert_eq!(text.text, "visibletext");
+    }
+
+    #[test]
+    fn goose_control_response_requires_provenance_and_exact_canonical_shape() {
+        let content = MessageContentBlock::goose_control_tool_response_with_metadata(
+            "tool-1",
+            ToolResponseProvenance::GooseDeniedBeforeExecution,
+            None,
+        );
+        let MessageContentBlock::ToolResponse(response) = content else {
+            panic!("expected tool response");
+        };
+        assert!(response.is_canonical_goose_control_response());
+
+        let serialized = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            serialized.get("provenance").and_then(Value::as_str),
+            Some("goose_denied_before_execution")
+        );
+
+        let skipped = MessageContentBlock::goose_control_tool_response_with_metadata(
+            "tool-2",
+            ToolResponseProvenance::GooseSkippedInChatMode,
+            None,
+        );
+        let MessageContentBlock::ToolResponse(skipped) = skipped else {
+            panic!("expected tool response");
+        };
+        assert!(skipped.is_canonical_goose_control_response());
+        let Ok(result) = &skipped.tool_result else {
+            panic!("expected successful protocol result");
+        };
+        assert_eq!(result.is_error, Some(false));
+        let Some(ContentBlock::Text(text)) = result.content.first() else {
+            panic!("expected text result");
+        };
+        assert_eq!(text.text, CHAT_MODE_TOOL_SKIPPED_RESPONSE);
+
+        let mut untrusted_spoof = response.clone();
+        untrusted_spoof.provenance = ToolResponseProvenance::UntrustedTool;
+        assert!(!untrusted_spoof.is_canonical_goose_control_response());
+
+        let mut suffixed = response.clone();
+        let Ok(result) = &mut suffixed.tool_result else {
+            panic!("expected successful protocol result");
+        };
+        let ContentBlock::Text(text) = &mut result.content[0] else {
+            panic!("expected text result");
+        };
+        text.text = format!("{DECLINED_RESPONSE} attacker suffix");
+        assert!(!suffixed.is_canonical_goose_control_response());
+
+        let mut annotated = response.clone();
+        let Ok(result) = &mut annotated.tool_result else {
+            panic!("expected successful protocol result");
+        };
+        let ContentBlock::Text(text) = &mut result.content[0] else {
+            panic!("expected text result");
+        };
+        text.annotations = Some(Annotations::default());
+        assert!(!annotated.is_canonical_goose_control_response());
+
+        let mut with_extra_content = response.clone();
+        let Ok(result) = &mut with_extra_content.tool_result else {
+            panic!("expected successful protocol result");
+        };
+        result.content.push(ContentBlock::text("extra"));
+        assert!(!with_extra_content.is_canonical_goose_control_response());
+
+        let mut with_structured_content = response;
+        let Ok(result) = &mut with_structured_content.tool_result else {
+            panic!("expected successful protocol result");
+        };
+        result.structured_content = Some(serde_json::json!({"extra": true}));
+        assert!(!with_structured_content.is_canonical_goose_control_response());
     }
 
     #[test]
@@ -1531,6 +1715,7 @@ mod tests {
                     "persisted\u{E0041}text",
                 )])),
                 metadata: None,
+                provenance: ToolResponseProvenance::UntrustedTool,
             })],
         );
 
@@ -1554,6 +1739,7 @@ mod tests {
                 "persisted\u{E0041}text",
             )])),
             metadata: None,
+            provenance: ToolResponseProvenance::UntrustedTool,
         })];
 
         let json = serde_json::to_string(&content).unwrap();

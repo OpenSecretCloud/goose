@@ -17,9 +17,8 @@ use crate::agents::state_machine::operation::{
 use crate::agents::state_machine::ops_toolcalling::{
     pending_tool_requests, tool_span, ToolDisposition,
 };
-use crate::agents::tool_execution::{CHAT_MODE_TOOL_SKIPPED_RESPONSE, DECLINED_RESPONSE};
 use crate::config::GooseMode;
-use crate::conversation::message::Message;
+use crate::conversation::message::{Message, ToolResponseProvenance};
 use crate::conversation::Conversation;
 use crate::session::Session;
 
@@ -323,7 +322,12 @@ impl Operation for SkillOperation {
         for (request, disposition) in pending {
             let result = match disposition {
                 ToolDisposition::Execute if session.goose_mode == GooseMode::Chat => {
-                    CallToolResult::success(vec![ContentBlock::text(CHAT_MODE_TOOL_SKIPPED_RESPONSE)])
+                    response.add_goose_control_tool_response_with_metadata(
+                        request.id,
+                        ToolResponseProvenance::GooseSkippedInChatMode,
+                        request.metadata.as_ref(),
+                    );
+                    continue;
                 }
                 ToolDisposition::Execute => {
                     let tool_call = request.tool_call.as_ref().map_err(|error| {
@@ -339,8 +343,13 @@ impl Operation for SkillOperation {
                     }
                     result
                 }
-                ToolDisposition::Decline => {
-                    CallToolResult::error(vec![ContentBlock::text(DECLINED_RESPONSE)])
+                ToolDisposition::Decline(provenance) => {
+                    response.add_goose_control_tool_response_with_metadata(
+                        request.id,
+                        provenance,
+                        request.metadata.as_ref(),
+                    );
+                    continue;
                 }
                 ToolDisposition::ParseError(error) => {
                     CallToolResult::error(vec![ContentBlock::text(format!(

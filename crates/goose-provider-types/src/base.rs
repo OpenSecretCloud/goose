@@ -591,6 +591,12 @@ pub trait Provider: Send + Sync {
         false
     }
 
+    /// Whether this provider's policy boundary cannot be preserved by Goose
+    /// subagents, requiring delegated execution to be rejected.
+    fn blocks_subagent_delegation(&self) -> bool {
+        false
+    }
+
     fn set_session_title_callback(&self, _callback: Arc<dyn Fn(String) + Send + Sync>) {}
 
     /// Configure OAuth authentication for this provider
