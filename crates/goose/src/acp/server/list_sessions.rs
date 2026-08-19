@@ -1,6 +1,6 @@
 use super::{build_session_info, meta_string, GooseAcpAgent, ResultExt};
 use crate::session::session_manager::{
-    SessionListCursor, SessionListFilters, SessionListPageQuery, SessionType,
+    SessionListFilters, SessionListKeysetCursor, SessionListStoragePageQuery, SessionType,
 };
 use agent_client_protocol::schema::v1::{
     ListSessionsRequest, ListSessionsResponse, Meta, SessionInfo,
@@ -126,7 +126,7 @@ fn decode_session_list_cursor(
     cwd: Option<&std::path::Path>,
     session_types: &[SessionType],
     keyword: Option<&str>,
-) -> Result<Option<SessionListCursor>, agent_client_protocol::Error> {
+) -> Result<Option<SessionListKeysetCursor>, agent_client_protocol::Error> {
     let Some(cursor) = cursor else {
         return Ok(None);
     };
@@ -148,14 +148,14 @@ fn decode_session_list_cursor(
         ));
     }
 
-    Ok(Some(SessionListCursor {
+    Ok(Some(SessionListKeysetCursor {
         sort_at: token.sort_at,
         session_id: token.session_id,
     }))
 }
 
 fn encode_session_list_cursor(
-    cursor: &SessionListCursor,
+    cursor: &SessionListKeysetCursor,
     cwd: Option<&std::path::Path>,
     session_types: &[SessionType],
     keyword: Option<&str>,
@@ -197,7 +197,7 @@ impl GooseAcpAgent {
         // ACP clients see their own (Acp) sessions plus legacy User/Scheduled ones.
         let page = self
             .session_manager
-            .list_sessions_paged(SessionListPageQuery {
+            .list_sessions_storage_paged(SessionListStoragePageQuery {
                 filters: SessionListFilters {
                     types: Some(&session_types),
                     working_dir: cwd,
