@@ -21,5 +21,9 @@ pub use export_markdown::{
 };
 pub use extension_data::{EnabledExtensionsState, ExtensionData, ExtensionState, TodoState};
 pub use session_manager::{
-    Session, SessionInsights, SessionManager, SessionNameUpdate, SessionType, SessionUpdateBuilder,
+    MessageHistoryCursor, MessageHistoryPage, MessageHistoryPageError, MessageHistoryPageQuery,
+    MessageHistoryRecord, MessageHistoryRevision, Session, SessionInsights, SessionListCursor,
+    SessionListPage, SessionListPageError, SessionListPageQuery, SessionManager, SessionNameUpdate,
+    SessionType, SessionUpdateBuilder, DEFAULT_MESSAGE_HISTORY_PAGE_SIZE,
+    DEFAULT_SESSION_LIST_PAGE_SIZE, MAX_MESSAGE_HISTORY_PAGE_SIZE, MAX_SESSION_LIST_PAGE_SIZE,
 };

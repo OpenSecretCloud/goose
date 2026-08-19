@@ -11,23 +11,37 @@ use crate::session::session_naming::{
     generate_session_name, MSG_COUNT_FOR_SESSION_NAME_GENERATION,
 };
 use anyhow::Result;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, TimeZone, Utc};
+use futures::TryStreamExt;
 use goose_providers::conversation::token_usage::Usage;
 use goose_providers::model::ModelConfig;
 use rmcp::model::Role;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Pool, Sqlite};
 use std::collections::HashMap;
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
 use tracing::{info, warn};
 
-pub const CURRENT_SCHEMA_VERSION: i32 = 16;
+pub const CURRENT_SCHEMA_VERSION: i32 = 17;
 pub const SESSIONS_FOLDER: &str = "sessions";
 pub const DB_NAME: &str = "sessions.db";
 const MILLISECOND_TIMESTAMP_THRESHOLD: i64 = 10_000_000_000;
+pub const DEFAULT_MESSAGE_HISTORY_PAGE_SIZE: usize = 25;
+pub const MAX_MESSAGE_HISTORY_PAGE_SIZE: usize = 50;
+pub const DEFAULT_SESSION_LIST_PAGE_SIZE: usize = 25;
+pub const MAX_SESSION_LIST_PAGE_SIZE: usize = 50;
+const MESSAGE_HISTORY_CURSOR_VERSION: u8 = 1;
+const MESSAGE_HISTORY_CURSOR_MAX_LENGTH: usize = 4096;
+const MESSAGE_HISTORY_WRITER_COLLATION: &str = "goose_message_history_writer_v17";
+const SESSION_LIST_CURSOR_VERSION: u8 = 1;
+const SESSION_LIST_CURSOR_MAX_LENGTH: usize = 4096;
 
 #[derive(
     Debug,
@@ -316,16 +330,298 @@ pub struct SessionManager {
     storage: Arc<SessionStorage>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct MessageHistoryCursor(String);
+
+impl fmt::Display for MessageHistoryCursor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl FromStr for MessageHistoryCursor {
+    type Err = MessageHistoryPageError;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        let cursor = Self(value.to_string());
+        decode_message_history_cursor(&cursor)?;
+        Ok(cursor)
+    }
+}
+
+impl AsRef<str> for MessageHistoryCursor {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct MessageHistoryRevision(String);
+
+impl fmt::Display for MessageHistoryRevision {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for MessageHistoryRevision {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MessageHistoryRecord {
+    pub record_id: String,
+    pub message: Message,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MessageHistoryPageQuery {
+    pub cursor: Option<MessageHistoryCursor>,
+    pub page_size: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MessageHistoryPage {
+    pub messages: Vec<MessageHistoryRecord>,
+    pub next_cursor: Option<MessageHistoryCursor>,
+    pub history_revision: MessageHistoryRevision,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum MessageHistoryPageError {
+    #[error("message history cursor is malformed")]
+    InvalidCursor,
+    #[error("message history cursor belongs to a different session")]
+    CursorSessionMismatch,
+    #[error("message history cursor is stale")]
+    StaleRevision,
+    #[error("session not found")]
+    SessionNotFound,
+    #[error("message history page size must be between 1 and 50")]
+    InvalidPageSize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MessageHistoryCursorToken {
+    version: u8,
+    session_id: String,
+    history_epoch: i64,
+    created_timestamp: i64,
+    row_id: i64,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct MessageHistoryRow {
+    row_id: i64,
+    message_id: Option<String>,
+    role: String,
+    content_json: String,
+    created_timestamp: i64,
+    metadata_json: Option<String>,
+}
+
+fn decode_message_history_cursor(
+    cursor: &MessageHistoryCursor,
+) -> std::result::Result<MessageHistoryCursorToken, MessageHistoryPageError> {
+    if cursor.0.is_empty() || cursor.0.len() > MESSAGE_HISTORY_CURSOR_MAX_LENGTH {
+        return Err(MessageHistoryPageError::InvalidCursor);
+    }
+    let bytes = URL_SAFE_NO_PAD
+        .decode(&cursor.0)
+        .map_err(|_| MessageHistoryPageError::InvalidCursor)?;
+    let token: MessageHistoryCursorToken =
+        serde_json::from_slice(&bytes).map_err(|_| MessageHistoryPageError::InvalidCursor)?;
+    if token.version != MESSAGE_HISTORY_CURSOR_VERSION
+        || token.session_id.is_empty()
+        || token.history_epoch <= 0
+        || token.row_id <= 0
+    {
+        return Err(MessageHistoryPageError::InvalidCursor);
+    }
+    Ok(token)
+}
+
+fn encode_message_history_cursor(
+    token: &MessageHistoryCursorToken,
+) -> Result<MessageHistoryCursor> {
+    Ok(MessageHistoryCursor(
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(token)?),
+    ))
+}
+
+fn message_history_revision(history_epoch: i64) -> MessageHistoryRevision {
+    MessageHistoryRevision(format!(
+        "mhr_{}",
+        URL_SAFE_NO_PAD.encode(history_epoch.to_be_bytes())
+    ))
+}
+
+fn message_history_record_id(history_epoch: i64, row_id: i64) -> String {
+    let mut bytes = [0_u8; 16];
+    bytes[..8].copy_from_slice(&history_epoch.to_be_bytes());
+    bytes[8..].copy_from_slice(&row_id.to_be_bytes());
+    format!("mhrw_{}", URL_SAFE_NO_PAD.encode(bytes))
+}
+
+impl MessageHistoryRow {
+    fn into_record(self, history_epoch: i64) -> Result<MessageHistoryRecord> {
+        let role = match self.role.as_str() {
+            "user" => Role::User,
+            "assistant" => Role::Assistant,
+            role => anyhow::bail!("Unknown stored message role: {role}"),
+        };
+        let content = serde_json::from_str(&self.content_json)?;
+        let metadata = self
+            .metadata_json
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default();
+        let mut message = Message::new(role, self.created_timestamp, content);
+        message.metadata = metadata;
+        if let Some(message_id) = self.message_id {
+            message = message.with_id(message_id);
+        }
+        Ok(MessageHistoryRecord {
+            record_id: message_history_record_id(history_epoch, self.row_id),
+            message,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SessionListCursor(String);
+
+impl fmt::Display for SessionListCursor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl FromStr for SessionListCursor {
+    type Err = SessionListPageError;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        let cursor = Self(value.to_string());
+        decode_session_list_cursor(&cursor)?;
+        Ok(cursor)
+    }
+}
+
+impl AsRef<str> for SessionListCursor {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SessionListPageQuery {
+    pub cursor: Option<SessionListCursor>,
+    pub page_size: Option<usize>,
+    pub working_dir: Option<PathBuf>,
+    pub session_types: Option<Vec<SessionType>>,
+    pub keyword: Option<String>,
+    pub only_sessions_with_messages: bool,
+    pub include_last_message_snippet: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionListPage {
+    pub sessions: Vec<Session>,
+    pub next_cursor: Option<SessionListCursor>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum SessionListPageError {
+    #[error("session list cursor is malformed")]
+    InvalidCursor,
+    #[error("session list cursor does not match the requested filters")]
+    CursorFilterMismatch,
+    #[error("session list page size must be between 1 and 50")]
+    InvalidPageSize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionListCursorToken {
+    version: u8,
+    sort_at: DateTime<Utc>,
+    session_id: String,
+    filter_hash: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionListCursorFilters<'a> {
+    working_dir: Option<&'a str>,
+    session_types: Option<Vec<String>>,
+    keywords: Vec<String>,
+    only_sessions_with_messages: bool,
+    include_last_message_snippet: bool,
+}
+
+fn decode_session_list_cursor(
+    cursor: &SessionListCursor,
+) -> std::result::Result<SessionListCursorToken, SessionListPageError> {
+    if cursor.0.is_empty() || cursor.0.len() > SESSION_LIST_CURSOR_MAX_LENGTH {
+        return Err(SessionListPageError::InvalidCursor);
+    }
+    let bytes = URL_SAFE_NO_PAD
+        .decode(&cursor.0)
+        .map_err(|_| SessionListPageError::InvalidCursor)?;
+    let token: SessionListCursorToken =
+        serde_json::from_slice(&bytes).map_err(|_| SessionListPageError::InvalidCursor)?;
+    if token.version != SESSION_LIST_CURSOR_VERSION
+        || token.session_id.is_empty()
+        || token.filter_hash.is_empty()
+    {
+        return Err(SessionListPageError::InvalidCursor);
+    }
+    Ok(token)
+}
+
+fn encode_session_list_cursor(token: &SessionListCursorToken) -> Result<SessionListCursor> {
+    Ok(SessionListCursor(
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(token)?),
+    ))
+}
+
+fn session_list_filter_hash(query: &SessionListPageQuery) -> Result<String> {
+    let mut session_types = query
+        .session_types
+        .as_deref()
+        .map(|types| types.iter().map(ToString::to_string).collect::<Vec<_>>());
+    if let Some(session_types) = &mut session_types {
+        session_types.sort();
+        session_types.dedup();
+    }
+    let working_dir = query
+        .working_dir
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned());
+    let filters = SessionListCursorFilters {
+        working_dir: working_dir.as_deref(),
+        session_types,
+        keywords: keyword_terms(query.keyword.as_deref()),
+        only_sessions_with_messages: query.only_sessions_with_messages,
+        include_last_message_snippet: query.include_last_message_snippet,
+    };
+    Ok(URL_SAFE_NO_PAD.encode(Sha256::digest(serde_json::to_vec(&filters)?)))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SessionListCursor {
+pub(crate) struct SessionListKeysetCursor {
     pub(crate) sort_at: DateTime<Utc>,
     pub(crate) session_id: String,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct SessionListPage {
+pub(crate) struct SessionListStoragePage {
     pub(crate) sessions: Vec<Session>,
-    pub(crate) next_cursor: Option<SessionListCursor>,
+    pub(crate) next_cursor: Option<SessionListKeysetCursor>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -337,9 +633,9 @@ pub(crate) struct SessionListFilters<'a> {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct SessionListPageQuery<'a> {
+pub(crate) struct SessionListStoragePageQuery<'a> {
     pub(crate) filters: SessionListFilters<'a>,
-    pub(crate) cursor: Option<&'a SessionListCursor>,
+    pub(crate) cursor: Option<&'a SessionListKeysetCursor>,
     pub(crate) page_size: usize,
     pub(crate) include_last_message_snippet: bool,
 }
@@ -347,7 +643,7 @@ pub(crate) struct SessionListPageQuery<'a> {
 #[derive(Debug, Default)]
 struct SessionListQuery<'a> {
     filters: SessionListFilters<'a>,
-    cursor: Option<&'a SessionListCursor>,
+    cursor: Option<&'a SessionListKeysetCursor>,
     limit: Option<usize>,
 }
 
@@ -444,6 +740,18 @@ impl SessionManager {
         self.storage.add_message(id, message).await
     }
 
+    /// Returns native persisted message records in newest-first order.
+    ///
+    /// The pager deliberately does not apply user-visibility projection. Callers
+    /// that cross a trust boundary must project each returned `Message` first.
+    pub async fn list_messages_paged(
+        &self,
+        session_id: &str,
+        query: MessageHistoryPageQuery,
+    ) -> Result<MessageHistoryPage> {
+        self.storage.list_messages_paged(session_id, query).await
+    }
+
     pub async fn replace_conversation(&self, id: &str, conversation: &Conversation) -> Result<()> {
         self.storage.replace_conversation(id, conversation).await
     }
@@ -456,11 +764,71 @@ impl SessionManager {
         self.storage.list_sessions_by_types(Some(types)).await
     }
 
-    pub(crate) async fn list_sessions_paged(
+    /// Pages are keyset-consistent, not snapshot-consistent. If a session's sort
+    /// key (`last_message_at.unwrap_or(updated_at)`) changes while a cursor is in
+    /// flight, that session may move, repeat, or be absent from a continuation.
+    /// Sessions whose sort keys do not change remain reachable in keyset order.
+    /// Callers should merge head updates and deduplicate by stable session ID.
+    pub async fn list_sessions_paged(
         &self,
-        query: SessionListPageQuery<'_>,
+        query: SessionListPageQuery,
     ) -> Result<SessionListPage> {
-        self.storage.list_sessions_paged(query).await
+        let page_size = query.page_size.unwrap_or(DEFAULT_SESSION_LIST_PAGE_SIZE);
+        if page_size == 0 || page_size > MAX_SESSION_LIST_PAGE_SIZE {
+            return Err(SessionListPageError::InvalidPageSize.into());
+        }
+        let filter_hash = session_list_filter_hash(&query)?;
+        let cursor = query
+            .cursor
+            .as_ref()
+            .map(decode_session_list_cursor)
+            .transpose()?;
+        if cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.filter_hash != filter_hash)
+        {
+            return Err(SessionListPageError::CursorFilterMismatch.into());
+        }
+        let keyset_cursor = cursor.as_ref().map(|cursor| SessionListKeysetCursor {
+            sort_at: cursor.sort_at,
+            session_id: cursor.session_id.clone(),
+        });
+        let storage_page = self
+            .storage
+            .list_sessions_storage_paged(SessionListStoragePageQuery {
+                filters: SessionListFilters {
+                    types: query.session_types.as_deref(),
+                    working_dir: query.working_dir.as_deref(),
+                    keyword: query.keyword.as_deref(),
+                    only_sessions_with_messages: query.only_sessions_with_messages,
+                },
+                cursor: keyset_cursor.as_ref(),
+                page_size,
+                include_last_message_snippet: query.include_last_message_snippet,
+            })
+            .await?;
+        let next_cursor = storage_page
+            .next_cursor
+            .map(|cursor| {
+                encode_session_list_cursor(&SessionListCursorToken {
+                    version: SESSION_LIST_CURSOR_VERSION,
+                    sort_at: cursor.sort_at,
+                    session_id: cursor.session_id,
+                    filter_hash,
+                })
+            })
+            .transpose()?;
+        Ok(SessionListPage {
+            sessions: storage_page.sessions,
+            next_cursor,
+        })
+    }
+
+    pub(crate) async fn list_sessions_storage_paged(
+        &self,
+        query: SessionListStoragePageQuery<'_>,
+    ) -> Result<SessionListStoragePage> {
+        self.storage.list_sessions_storage_paged(query).await
     }
 
     pub async fn list_all_sessions(&self) -> Result<Vec<Session>> {
@@ -692,6 +1060,15 @@ pub struct SessionStorage {
     initialized: tokio::sync::OnceCell<()>,
     session_dir: PathBuf,
     action_required: Arc<crate::action_required_manager::ActionRequiredManager>,
+    #[cfg(test)]
+    message_history_page_metrics: std::sync::Mutex<MessageHistoryPageMetrics>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct MessageHistoryPageMetrics {
+    select_count: usize,
+    rows_returned: usize,
 }
 
 pub(crate) fn role_to_string(role: &Role) -> &'static str {
@@ -922,7 +1299,8 @@ impl SessionStorage {
             .create_if_missing(true)
             .foreign_keys(true)
             .busy_timeout(std::time::Duration::from_secs(30))
-            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .collation(MESSAGE_HISTORY_WRITER_COLLATION, str::cmp);
 
         SqlitePoolOptions::new().connect_lazy_with(options)
     }
@@ -935,7 +1313,21 @@ impl SessionStorage {
             initialized: tokio::sync::OnceCell::new(),
             session_dir,
             action_required: Arc::new(crate::action_required_manager::ActionRequiredManager::new()),
+            #[cfg(test)]
+            message_history_page_metrics: std::sync::Mutex::new(
+                MessageHistoryPageMetrics::default(),
+            ),
         }
+    }
+
+    #[cfg(test)]
+    fn reset_message_history_page_metrics(&self) {
+        *self.message_history_page_metrics.lock().unwrap() = MessageHistoryPageMetrics::default();
+    }
+
+    #[cfg(test)]
+    fn message_history_page_metrics(&self) -> MessageHistoryPageMetrics {
+        *self.message_history_page_metrics.lock().unwrap()
     }
 
     pub(crate) async fn pool(&self) -> Result<&Pool<Sqlite>> {
@@ -1049,6 +1441,8 @@ impl SessionStorage {
         .execute(&mut *tx)
         .await?;
 
+        Self::ensure_message_history_schema(&mut tx).await?;
+
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS usage_ledger (
@@ -1105,6 +1499,80 @@ impl SessionStorage {
 
         tx.commit().await?;
 
+        Ok(())
+    }
+
+    async fn ensure_message_history_schema(tx: &mut sqlx::Transaction<'_, Sqlite>) -> Result<()> {
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS session_history_state (
+                cursor_epoch INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL UNIQUE REFERENCES sessions(id) ON DELETE CASCADE
+            )
+            "#,
+        )
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO session_history_state (session_id)
+            SELECT id FROM sessions ORDER BY id
+            "#,
+        )
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query(
+            r#"
+            CREATE TRIGGER IF NOT EXISTS insert_session_history_state
+            AFTER INSERT ON sessions
+            BEGIN
+                INSERT OR IGNORE INTO session_history_state (session_id) VALUES (NEW.id);
+            END
+            "#,
+        )
+        .execute(&mut **tx)
+        .await?;
+        for (trigger_name, operation) in [
+            ("message_history_writer_insert_guard", "INSERT"),
+            ("message_history_writer_update_guard", "UPDATE"),
+            ("message_history_writer_delete_guard", "DELETE"),
+        ] {
+            sqlx::query(&format!("DROP TRIGGER IF EXISTS {trigger_name}"))
+                .execute(&mut **tx)
+                .await?;
+            sqlx::query(&format!(
+                r#"
+                CREATE TRIGGER IF NOT EXISTS {trigger_name}
+                BEFORE {operation} ON messages
+                BEGIN
+                    SELECT CASE
+                        WHEN ('a' COLLATE {MESSAGE_HISTORY_WRITER_COLLATION}) < 'b' THEN NULL
+                        ELSE RAISE(ABORT, 'message history writer version mismatch')
+                    END;
+                END
+                "#,
+            ))
+            .execute(&mut **tx)
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn rotate_message_history_epoch(
+        tx: &mut sqlx::Transaction<'_, Sqlite>,
+        session_id: &str,
+    ) -> Result<()> {
+        let deleted = sqlx::query("DELETE FROM session_history_state WHERE session_id = ?")
+            .bind(session_id)
+            .execute(&mut **tx)
+            .await?;
+        if deleted.rows_affected() == 0 {
+            anyhow::bail!("Session not found: {session_id}");
+        }
+        sqlx::query("INSERT INTO session_history_state (session_id) VALUES (?)")
+            .bind(session_id)
+            .execute(&mut **tx)
+            .await?;
         Ok(())
     }
 
@@ -1224,6 +1692,12 @@ impl SessionStorage {
         let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
 
         let current_version = Self::get_schema_version(&mut tx).await?;
+
+        if current_version > CURRENT_SCHEMA_VERSION {
+            anyhow::bail!(
+                "Session database schema version {current_version} is newer than supported version {CURRENT_SCHEMA_VERSION}"
+            );
+        }
 
         if current_version < CURRENT_SCHEMA_VERSION {
             info!(
@@ -1570,6 +2044,9 @@ impl SessionStorage {
                 .execute(&mut **tx)
                 .await?;
             }
+            17 => {
+                Self::ensure_message_history_schema(tx).await?;
+            }
             _ => {
                 anyhow::bail!("Unknown migration version: {}", version);
             }
@@ -1851,6 +2328,126 @@ impl SessionStorage {
         Ok(Conversation::new_unvalidated(messages))
     }
 
+    async fn list_messages_paged(
+        &self,
+        session_id: &str,
+        query: MessageHistoryPageQuery,
+    ) -> Result<MessageHistoryPage> {
+        let page_size = query.page_size.unwrap_or(DEFAULT_MESSAGE_HISTORY_PAGE_SIZE);
+        if page_size == 0 || page_size > MAX_MESSAGE_HISTORY_PAGE_SIZE {
+            return Err(MessageHistoryPageError::InvalidPageSize.into());
+        }
+
+        let cursor = query
+            .cursor
+            .as_ref()
+            .map(decode_message_history_cursor)
+            .transpose()?;
+        if cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.session_id != session_id)
+        {
+            return Err(MessageHistoryPageError::CursorSessionMismatch.into());
+        }
+
+        let pool = self.pool().await?;
+        let mut tx = pool.begin().await?;
+        #[cfg(test)]
+        {
+            self.message_history_page_metrics
+                .lock()
+                .unwrap()
+                .select_count += 1;
+        }
+        let history_epoch = sqlx::query_scalar::<_, i64>(
+            "SELECT cursor_epoch FROM session_history_state WHERE session_id = ?",
+        )
+        .bind(session_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(MessageHistoryPageError::SessionNotFound)?;
+        #[cfg(test)]
+        {
+            self.message_history_page_metrics
+                .lock()
+                .unwrap()
+                .rows_returned += 1;
+        }
+        if cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.history_epoch != history_epoch)
+        {
+            return Err(MessageHistoryPageError::StaleRevision.into());
+        }
+
+        let mut query_builder = sqlx::QueryBuilder::<Sqlite>::new(
+            r#"
+            SELECT id AS row_id, message_id, role, content_json, created_timestamp, metadata_json
+            FROM messages
+            WHERE session_id =
+            "#,
+        );
+        query_builder.push_bind(session_id);
+        if let Some(cursor) = &cursor {
+            query_builder
+                .push(" AND (created_timestamp < ")
+                .push_bind(cursor.created_timestamp)
+                .push(" OR (created_timestamp = ")
+                .push_bind(cursor.created_timestamp)
+                .push(" AND id < ")
+                .push_bind(cursor.row_id)
+                .push("))");
+        }
+        query_builder
+            .push(" ORDER BY created_timestamp DESC, id DESC LIMIT ")
+            .push_bind((page_size + 1) as i64);
+
+        let mut rows = query_builder
+            .build_query_as::<MessageHistoryRow>()
+            .fetch(&mut *tx);
+        let mut fetched_rows = Vec::with_capacity(page_size + 1);
+        while let Some(row) = rows.try_next().await? {
+            fetched_rows.push(row);
+        }
+        drop(rows);
+        #[cfg(test)]
+        {
+            let mut metrics = self.message_history_page_metrics.lock().unwrap();
+            metrics.select_count += 1;
+            metrics.rows_returned += fetched_rows.len();
+        }
+
+        let has_next_page = fetched_rows.len() > page_size;
+        if has_next_page {
+            fetched_rows.truncate(page_size);
+        }
+        let next_cursor = if has_next_page {
+            let anchor = fetched_rows
+                .last()
+                .expect("a page with a continuation has a delivered row");
+            Some(encode_message_history_cursor(&MessageHistoryCursorToken {
+                version: MESSAGE_HISTORY_CURSOR_VERSION,
+                session_id: session_id.to_string(),
+                history_epoch,
+                created_timestamp: anchor.created_timestamp,
+                row_id: anchor.row_id,
+            })?)
+        } else {
+            None
+        };
+        let messages = fetched_rows
+            .into_iter()
+            .map(|row| row.into_record(history_epoch))
+            .collect::<Result<Vec<_>>>()?;
+        tx.commit().await?;
+
+        Ok(MessageHistoryPage {
+            messages,
+            next_cursor,
+            history_revision: message_history_revision(history_epoch),
+        })
+    }
+
     async fn add_message(&self, session_id: &str, message: &Message) -> Result<()> {
         let pool = self.pool().await?;
         let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -1931,6 +2528,8 @@ impl SessionStorage {
             .execute(&mut *tx)
             .await?;
         }
+
+        Self::rotate_message_history_epoch(&mut tx, session_id).await?;
 
         tx.commit().await?;
         Ok(())
@@ -2060,12 +2659,12 @@ impl SessionStorage {
         .await
     }
 
-    async fn list_sessions_paged(
+    async fn list_sessions_storage_paged(
         &self,
-        query: SessionListPageQuery<'_>,
-    ) -> Result<SessionListPage> {
+        query: SessionListStoragePageQuery<'_>,
+    ) -> Result<SessionListStoragePage> {
         if matches!(query.filters.types, Some(types) if types.is_empty()) || query.page_size == 0 {
-            return Ok(SessionListPage {
+            return Ok(SessionListStoragePage {
                 sessions: Vec::new(),
                 next_cursor: None,
             });
@@ -2083,7 +2682,7 @@ impl SessionStorage {
         let has_next_page = sessions.len() > page_size;
         let next_cursor = if has_next_page {
             let anchor = &sessions[page_size - 1];
-            Some(SessionListCursor {
+            Some(SessionListKeysetCursor {
                 sort_at: session_sort_at(anchor),
                 session_id: anchor.id.clone(),
             })
@@ -2098,7 +2697,7 @@ impl SessionStorage {
             super::last_message_snippet::hydrate_last_message_snippets(pool, &mut sessions).await?;
         }
 
-        Ok(SessionListPage {
+        Ok(SessionListStoragePage {
             sessions,
             next_cursor,
         })
@@ -2443,11 +3042,17 @@ impl SessionStorage {
 
     async fn truncate_conversation(&self, session_id: &str, timestamp: i64) -> Result<()> {
         let pool = self.pool().await?;
-        sqlx::query("DELETE FROM messages WHERE session_id = ? AND created_timestamp >= ?")
-            .bind(session_id)
-            .bind(timestamp)
-            .execute(pool)
-            .await?;
+        let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+        let deleted =
+            sqlx::query("DELETE FROM messages WHERE session_id = ? AND created_timestamp >= ?")
+                .bind(session_id)
+                .bind(timestamp)
+                .execute(&mut *tx)
+                .await?;
+        if deleted.rows_affected() > 0 {
+            Self::rotate_message_history_epoch(&mut tx, session_id).await?;
+        }
+        tx.commit().await?;
 
         Ok(())
     }
@@ -2469,7 +3074,7 @@ impl SessionStorage {
         .await?;
 
         if let Some((boundary_id, boundary_timestamp)) = boundary {
-            sqlx::query(
+            let deleted = sqlx::query(
                 "DELETE FROM messages WHERE session_id = ? AND (created_timestamp > ? OR (created_timestamp = ? AND id >= ?))",
             )
             .bind(session_id)
@@ -2478,6 +3083,9 @@ impl SessionStorage {
             .bind(boundary_id)
             .execute(&mut *tx)
             .await?;
+            if deleted.rows_affected() > 0 {
+                Self::rotate_message_history_epoch(&mut tx, session_id).await?;
+            }
         }
 
         tx.commit().await?;
@@ -2534,8 +3142,13 @@ impl SessionStorage {
         let current_metadata: crate::conversation::message::MessageMetadata =
             serde_json::from_str(&current_metadata_json)?;
 
-        let new_metadata = f(current_metadata);
+        let new_metadata = f(current_metadata.clone());
         let metadata_json = serde_json::to_string(&new_metadata)?;
+
+        if current_metadata == new_metadata {
+            tx.commit().await?;
+            return Ok(());
+        }
 
         sqlx::query(
             "UPDATE messages SET metadata_json = ? WHERE message_id = ? AND session_id = ?",
@@ -2545,6 +3158,7 @@ impl SessionStorage {
         .bind(session_id)
         .execute(&mut *tx)
         .await?;
+        Self::rotate_message_history_epoch(&mut tx, session_id).await?;
 
         tx.commit().await?;
 
@@ -2641,11 +3255,16 @@ impl SessionStorage {
             }
 
             let updated_json = serde_json::to_string(&content)?;
+            if updated_json == content_json {
+                tx.commit().await?;
+                return Ok(());
+            }
             sqlx::query("UPDATE messages SET content_json = ? WHERE id = ?")
                 .bind(updated_json)
                 .bind(row_id)
                 .execute(&mut *tx)
                 .await?;
+            Self::rotate_message_history_epoch(&mut tx, session_id).await?;
             tx.commit().await?;
             return Ok(());
         }
@@ -3458,15 +4077,15 @@ mod tests {
 
     async fn assert_session_list_page(
         sm: &SessionManager,
-        cursor: Option<&SessionListCursor>,
+        cursor: Option<&SessionListKeysetCursor>,
         working_dir: Option<&str>,
         page_size: usize,
         expected_ids: &[String],
         expected_next_cursor: bool,
-    ) -> Option<SessionListCursor> {
+    ) -> Option<SessionListKeysetCursor> {
         let types = [SessionType::User];
         let page = sm
-            .list_sessions_paged(SessionListPageQuery {
+            .list_sessions_storage_paged(SessionListStoragePageQuery {
                 filters: SessionListFilters {
                     types: Some(&types),
                     working_dir: working_dir.map(Path::new),
@@ -3660,6 +4279,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_session_list_paged_mutable_sort_keys_preserve_untouched_suffix() {
+        let temp_dir = TempDir::new().unwrap();
+        let sm = SessionManager::new(temp_dir.path().to_path_buf());
+        let mut session_ids = Vec::new();
+        for created_timestamp in [400, 300, 200, 100] {
+            let session_id = create_message_history_test_session(&sm).await;
+            add_history_message(
+                &sm,
+                &session_id,
+                &format!("message-{created_timestamp}"),
+                "message",
+                created_timestamp,
+            )
+            .await;
+            session_ids.push(session_id);
+        }
+        let query = |cursor, page_size| SessionListPageQuery {
+            cursor,
+            page_size: Some(page_size),
+            working_dir: Some(PathBuf::from("/tmp/message-history")),
+            session_types: Some(vec![SessionType::User]),
+            only_sessions_with_messages: true,
+            ..Default::default()
+        };
+
+        let first = sm.list_sessions_paged(query(None, 2)).await.unwrap();
+        assert_eq!(
+            first
+                .sessions
+                .iter()
+                .map(|session| &session.id)
+                .collect::<Vec<_>>(),
+            [&session_ids[0], &session_ids[1]]
+        );
+        let cursor = first.next_cursor.unwrap();
+        let pool = sm.storage().pool().await.unwrap();
+
+        sqlx::query("UPDATE messages SET created_timestamp = 50 WHERE session_id = ?")
+            .bind(&session_ids[0])
+            .execute(pool)
+            .await
+            .unwrap();
+        let repeated = sm
+            .list_sessions_paged(query(Some(cursor.clone()), 3))
+            .await
+            .unwrap();
+        assert_eq!(
+            repeated
+                .sessions
+                .iter()
+                .map(|session| &session.id)
+                .collect::<Vec<_>>(),
+            [&session_ids[2], &session_ids[3], &session_ids[0]]
+        );
+
+        sqlx::query("UPDATE messages SET created_timestamp = 400 WHERE session_id = ?")
+            .bind(&session_ids[0])
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE messages SET created_timestamp = 500 WHERE session_id = ?")
+            .bind(&session_ids[2])
+            .execute(pool)
+            .await
+            .unwrap();
+        let moved_ahead = sm
+            .list_sessions_paged(query(Some(cursor), 3))
+            .await
+            .unwrap();
+        assert_eq!(
+            moved_ahead
+                .sessions
+                .iter()
+                .map(|session| &session.id)
+                .collect::<Vec<_>>(),
+            [&session_ids[3]]
+        );
+        assert!(moved_ahead.next_cursor.is_none());
+    }
+
+    #[tokio::test]
     async fn test_session_list_paged_filters_empty_and_cwd_before_pagination() {
         let temp_dir = TempDir::new().unwrap();
         let sm = SessionManager::new(temp_dir.path().to_path_buf());
@@ -3706,7 +4406,7 @@ mod tests {
 
         let types = [SessionType::User];
         let page = sm
-            .list_sessions_paged(SessionListPageQuery {
+            .list_sessions_storage_paged(SessionListStoragePageQuery {
                 filters: SessionListFilters {
                     types: Some(&types),
                     keyword: Some("postgres"),
@@ -3748,7 +4448,7 @@ mod tests {
 
         let types = [SessionType::User];
         let page = sm
-            .list_sessions_paged(SessionListPageQuery {
+            .list_sessions_storage_paged(SessionListStoragePageQuery {
                 filters: SessionListFilters {
                     types: Some(&types),
                     keyword: Some("postgres sqlite"),
@@ -3783,7 +4483,7 @@ mod tests {
 
         let types = [SessionType::User];
         let page = sm
-            .list_sessions_paged(SessionListPageQuery {
+            .list_sessions_storage_paged(SessionListStoragePageQuery {
                 filters: SessionListFilters {
                     types: Some(&types),
                     keyword: Some("   "),
@@ -3822,7 +4522,7 @@ mod tests {
 
         let types = [SessionType::User];
         let percent_page = sm
-            .list_sessions_paged(SessionListPageQuery {
+            .list_sessions_storage_paged(SessionListStoragePageQuery {
                 filters: SessionListFilters {
                     types: Some(&types),
                     keyword: Some("%"),
@@ -3843,7 +4543,7 @@ mod tests {
         assert_eq!(percent_ids, vec![percent_id]);
 
         let underscore_page = sm
-            .list_sessions_paged(SessionListPageQuery {
+            .list_sessions_storage_paged(SessionListStoragePageQuery {
                 filters: SessionListFilters {
                     types: Some(&types),
                     keyword: Some("_"),
@@ -3887,7 +4587,7 @@ mod tests {
             only_sessions_with_messages: true,
         };
         let cursor = sm
-            .list_sessions_paged(SessionListPageQuery {
+            .list_sessions_storage_paged(SessionListStoragePageQuery {
                 filters: filters.clone(),
                 cursor: None,
                 page_size: 1,
@@ -3904,7 +4604,7 @@ mod tests {
         assert!(cursor.next_cursor.is_some());
 
         let page = sm
-            .list_sessions_paged(SessionListPageQuery {
+            .list_sessions_storage_paged(SessionListStoragePageQuery {
                 filters,
                 cursor: cursor.next_cursor.as_ref(),
                 page_size: 1,
@@ -4665,5 +5365,1053 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(remaining, 0);
+    }
+
+    async fn create_message_history_test_session(sm: &SessionManager) -> String {
+        sm.create_session(
+            PathBuf::from("/tmp/message-history"),
+            "Message history".to_string(),
+            SessionType::User,
+            GooseMode::default(),
+        )
+        .await
+        .unwrap()
+        .id
+    }
+
+    async fn add_history_message(
+        sm: &SessionManager,
+        session_id: &str,
+        message_id: &str,
+        text: &str,
+        created_timestamp: i64,
+    ) {
+        sm.add_message(
+            session_id,
+            &Message::user().with_id(message_id).with_text(text),
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE messages SET created_timestamp = ? WHERE id = (SELECT MAX(id) FROM messages WHERE session_id = ?)",
+        )
+        .bind(created_timestamp)
+        .bind(session_id)
+        .execute(sm.storage().pool().await.unwrap())
+        .await
+        .unwrap();
+    }
+
+    fn history_page_texts(page: &MessageHistoryPage) -> Vec<String> {
+        page.messages
+            .iter()
+            .map(|record| record.message.as_concat_text())
+            .collect()
+    }
+
+    fn assert_history_page_error(error: anyhow::Error, expected: MessageHistoryPageError) {
+        assert_eq!(
+            error.downcast_ref::<MessageHistoryPageError>(),
+            Some(&expected)
+        );
+    }
+
+    async fn demote_message_history_schema_to_v16(pool: &Pool<Sqlite>) {
+        for trigger in [
+            "message_history_writer_insert_guard",
+            "message_history_writer_update_guard",
+            "message_history_writer_delete_guard",
+            "insert_session_history_state",
+        ] {
+            sqlx::query(&format!("DROP TRIGGER {trigger}"))
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query("DROP TABLE session_history_state")
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE schema_version SET version = 16")
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn message_history_pages_equal_timestamps_without_gaps_or_duplicates() {
+        let temp_dir = TempDir::new().unwrap();
+        let sm = SessionManager::new(temp_dir.path().to_path_buf());
+        let session_id = create_message_history_test_session(&sm).await;
+        for index in 0..101 {
+            add_history_message(
+                &sm,
+                &session_id,
+                &format!("message-{index}"),
+                &format!("text-{index}"),
+                1_000,
+            )
+            .await;
+        }
+
+        let mut cursor = None;
+        let mut revision = None;
+        let mut texts = Vec::new();
+        let mut record_ids = std::collections::HashSet::new();
+        for page_number in 0..5 {
+            let page = sm
+                .list_messages_paged(
+                    &session_id,
+                    MessageHistoryPageQuery {
+                        cursor,
+                        page_size: Some(25),
+                    },
+                )
+                .await
+                .unwrap();
+            if let Some(revision) = &revision {
+                assert_eq!(&page.history_revision, revision);
+            } else {
+                revision = Some(page.history_revision.clone());
+            }
+            for record in &page.messages {
+                assert!(record_ids.insert(record.record_id.clone()));
+            }
+            texts.extend(history_page_texts(&page));
+            cursor = page.next_cursor;
+            if page_number < 4 {
+                assert!(cursor.is_some());
+            }
+        }
+
+        let expected = (0..101)
+            .rev()
+            .map(|index| format!("text-{index}"))
+            .collect::<Vec<_>>();
+        assert_eq!(texts, expected);
+        assert!(cursor.is_none());
+
+        let first_page_ids = record_ids;
+        let repeated = sm
+            .list_messages_paged(
+                &session_id,
+                MessageHistoryPageQuery {
+                    page_size: Some(25),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(repeated
+            .messages
+            .iter()
+            .all(|record| first_page_ids.contains(&record.record_id)));
+    }
+
+    #[tokio::test]
+    async fn message_history_exact_boundary_has_no_empty_continuation() {
+        let temp_dir = TempDir::new().unwrap();
+        let sm = SessionManager::new(temp_dir.path().to_path_buf());
+        let session_id = create_message_history_test_session(&sm).await;
+        for index in 0..4 {
+            add_history_message(
+                &sm,
+                &session_id,
+                &format!("message-{index}"),
+                &format!("text-{index}"),
+                index,
+            )
+            .await;
+        }
+
+        let first = sm
+            .list_messages_paged(
+                &session_id,
+                MessageHistoryPageQuery {
+                    page_size: Some(2),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let second = sm
+            .list_messages_paged(
+                &session_id,
+                MessageHistoryPageQuery {
+                    cursor: first.next_cursor,
+                    page_size: Some(2),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(history_page_texts(&second), ["text-1", "text-0"]);
+        assert!(second.next_cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn message_history_append_preserves_existing_cursor_and_revision() {
+        let temp_dir = TempDir::new().unwrap();
+        let sm = SessionManager::new(temp_dir.path().to_path_buf());
+        let session_id = create_message_history_test_session(&sm).await;
+        for index in 0..4 {
+            add_history_message(
+                &sm,
+                &session_id,
+                &format!("message-{index}"),
+                &format!("text-{index}"),
+                1_000,
+            )
+            .await;
+        }
+        let first = sm
+            .list_messages_paged(
+                &session_id,
+                MessageHistoryPageQuery {
+                    page_size: Some(2),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let encoded_cursor = first.next_cursor.clone().unwrap();
+        assert_eq!(
+            encoded_cursor.to_string().parse::<MessageHistoryCursor>(),
+            Ok(encoded_cursor.clone())
+        );
+        assert_eq!(
+            serde_json::from_str::<MessageHistoryCursor>(
+                &serde_json::to_string(&encoded_cursor).unwrap()
+            )
+            .unwrap(),
+            encoded_cursor
+        );
+
+        sm.add_message(
+            &session_id,
+            &Message::assistant()
+                .with_id("appended")
+                .with_text("appended"),
+        )
+        .await
+        .unwrap();
+        let continuation = sm
+            .list_messages_paged(
+                &session_id,
+                MessageHistoryPageQuery {
+                    cursor: first.next_cursor.clone(),
+                    page_size: Some(2),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(continuation.history_revision, first.history_revision);
+        assert_eq!(history_page_texts(&continuation), ["text-1", "text-0"]);
+
+        let fresh = sm
+            .list_messages_paged(
+                &session_id,
+                MessageHistoryPageQuery {
+                    page_size: Some(2),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(history_page_texts(&fresh)[0], "appended");
+        assert_eq!(fresh.history_revision, first.history_revision);
+    }
+
+    #[tokio::test]
+    async fn message_history_returns_native_hidden_and_multi_block_records() {
+        let temp_dir = TempDir::new().unwrap();
+        let sm = SessionManager::new(temp_dir.path().to_path_buf());
+        let session_id = create_message_history_test_session(&sm).await;
+        let hidden = Message::assistant()
+            .with_id("hidden")
+            .with_text("hidden")
+            .with_metadata(crate::conversation::message::MessageMetadata::agent_only());
+        let multi_block = Message::user()
+            .with_id("multi")
+            .with_text("first")
+            .with_text("second");
+        sm.add_message(&session_id, &hidden).await.unwrap();
+        sm.add_message(&session_id, &multi_block).await.unwrap();
+
+        let first_page = sm
+            .list_messages_paged(
+                &session_id,
+                MessageHistoryPageQuery {
+                    cursor: None,
+                    page_size: Some(1),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(first_page.messages.len(), 1);
+        assert_eq!(first_page.messages[0].message, multi_block);
+        assert_eq!(first_page.messages[0].message.content.len(), 2);
+        let second_page = sm
+            .list_messages_paged(
+                &session_id,
+                MessageHistoryPageQuery {
+                    cursor: first_page.next_cursor,
+                    page_size: Some(1),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(second_page.messages.len(), 1);
+        assert_eq!(second_page.messages[0].message, hidden);
+        assert!(!second_page.messages[0].message.metadata.user_visible);
+        assert!(second_page.next_cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn message_history_record_ids_do_not_depend_on_message_ids() {
+        let temp_dir = TempDir::new().unwrap();
+        let sm = SessionManager::new(temp_dir.path().to_path_buf());
+        let session_id = create_message_history_test_session(&sm).await;
+        let pool = sm.storage().pool().await.unwrap();
+        let content = serde_json::to_string(&Message::user().with_text("raw").content).unwrap();
+        let metadata =
+            serde_json::to_string(&crate::conversation::message::MessageMetadata::default())
+                .unwrap();
+        for (index, message_id) in [None, Some("duplicate"), Some("duplicate")]
+            .into_iter()
+            .enumerate()
+        {
+            sqlx::query(
+                "INSERT INTO messages (message_id, session_id, role, content_json, created_timestamp, metadata_json) VALUES (?, ?, 'user', ?, 1000, ?)",
+            )
+            .bind(message_id)
+            .bind(&session_id)
+            .bind(&content)
+            .bind(if index == 0 {
+                "invalid-metadata"
+            } else {
+                &metadata
+            })
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+
+        let first = sm
+            .list_messages_paged(&session_id, MessageHistoryPageQuery::default())
+            .await
+            .unwrap();
+        let second = sm
+            .list_messages_paged(&session_id, MessageHistoryPageQuery::default())
+            .await
+            .unwrap();
+        let first_ids = first
+            .messages
+            .iter()
+            .map(|record| record.record_id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let second_ids = second
+            .messages
+            .iter()
+            .map(|record| record.record_id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(first_ids.len(), 3);
+        assert_eq!(first_ids, second_ids);
+        assert_eq!(first.messages[2].message.id, None);
+        assert_eq!(
+            first.messages[2].message.metadata,
+            crate::conversation::message::MessageMetadata::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn message_history_rejects_wrong_session_and_replaced_history_cursor() {
+        let temp_dir = TempDir::new().unwrap();
+        let sm = SessionManager::new(temp_dir.path().to_path_buf());
+        let session_id = create_message_history_test_session(&sm).await;
+        let other_session_id = create_message_history_test_session(&sm).await;
+        for index in 0..3 {
+            add_history_message(
+                &sm,
+                &session_id,
+                &format!("same-{index}"),
+                &format!("old-{index}"),
+                1_000,
+            )
+            .await;
+        }
+        let first = sm
+            .list_messages_paged(
+                &session_id,
+                MessageHistoryPageQuery {
+                    page_size: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let cursor = first.next_cursor.clone().unwrap();
+        let error = sm
+            .list_messages_paged(
+                &other_session_id,
+                MessageHistoryPageQuery {
+                    cursor: Some(cursor.clone()),
+                    page_size: Some(1),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_history_page_error(error, MessageHistoryPageError::CursorSessionMismatch);
+
+        let replacement = Conversation::new_unvalidated([
+            Message::user().with_id("same-0").with_text("new-0"),
+            Message::assistant().with_id("same-1").with_text("new-1"),
+        ]);
+        sm.replace_conversation(&session_id, &replacement)
+            .await
+            .unwrap();
+        let error = sm
+            .list_messages_paged(
+                &session_id,
+                MessageHistoryPageQuery {
+                    cursor: Some(cursor),
+                    page_size: Some(1),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_history_page_error(error, MessageHistoryPageError::StaleRevision);
+        let fresh = sm
+            .list_messages_paged(&session_id, MessageHistoryPageQuery::default())
+            .await
+            .unwrap();
+        assert_ne!(fresh.history_revision, first.history_revision);
+        assert_eq!(history_page_texts(&fresh), ["new-1", "new-0"]);
+        assert!(fresh
+            .messages
+            .iter()
+            .all(|record| first.messages[0].record_id != record.record_id));
+    }
+
+    #[tokio::test]
+    async fn message_history_truncations_invalidate_cursors() {
+        let temp_dir = TempDir::new().unwrap();
+        let sm = SessionManager::new(temp_dir.path().to_path_buf());
+        let session_id = create_message_history_test_session(&sm).await;
+        for index in 0..4 {
+            add_history_message(
+                &sm,
+                &session_id,
+                &format!("message-{index}"),
+                &format!("text-{index}"),
+                1_000 + index,
+            )
+            .await;
+        }
+        let page = sm
+            .list_messages_paged(
+                &session_id,
+                MessageHistoryPageQuery {
+                    page_size: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        sm.truncate_conversation(&session_id, 1_002).await.unwrap();
+        let error = sm
+            .list_messages_paged(
+                &session_id,
+                MessageHistoryPageQuery {
+                    cursor: page.next_cursor,
+                    page_size: Some(1),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_history_page_error(error, MessageHistoryPageError::StaleRevision);
+
+        add_history_message(&sm, &session_id, "same-second-a", "a", 2_000).await;
+        add_history_message(&sm, &session_id, "same-second-b", "b", 2_000).await;
+        let page = sm
+            .list_messages_paged(
+                &session_id,
+                MessageHistoryPageQuery {
+                    page_size: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        sm.truncate_conversation_from_message(&session_id, "same-second-a")
+            .await
+            .unwrap();
+        let error = sm
+            .list_messages_paged(
+                &session_id,
+                MessageHistoryPageQuery {
+                    cursor: page.next_cursor,
+                    page_size: Some(1),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_history_page_error(error, MessageHistoryPageError::StaleRevision);
+        let fresh = sm
+            .list_messages_paged(&session_id, MessageHistoryPageQuery::default())
+            .await
+            .unwrap();
+        assert_eq!(history_page_texts(&fresh), ["text-1", "text-0"]);
+    }
+
+    #[tokio::test]
+    async fn message_history_in_place_mutations_invalidate_cursors() {
+        let temp_dir = TempDir::new().unwrap();
+        let sm = SessionManager::new(temp_dir.path().to_path_buf());
+        let session_id = create_message_history_test_session(&sm).await;
+        sm.add_message(
+            &session_id,
+            &Message::assistant().with_id("plain").with_text("plain"),
+        )
+        .await
+        .unwrap();
+        sm.add_message(
+            &session_id,
+            &Message::assistant().with_id("newest").with_text("newest"),
+        )
+        .await
+        .unwrap();
+        let page = sm
+            .list_messages_paged(
+                &session_id,
+                MessageHistoryPageQuery {
+                    page_size: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        sm.update_message_metadata(&session_id, "plain", |metadata| {
+            metadata.with_user_invisible()
+        })
+        .await
+        .unwrap();
+        let error = sm
+            .list_messages_paged(
+                &session_id,
+                MessageHistoryPageQuery {
+                    cursor: page.next_cursor,
+                    page_size: Some(1),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_history_page_error(error, MessageHistoryPageError::StaleRevision);
+
+        use rmcp::model::CallToolRequestParams;
+        sm.add_message(
+            &session_id,
+            &Message::assistant()
+                .with_id("tool-message")
+                .with_tool_request("tool-call", Ok(CallToolRequestParams::new("shell"))),
+        )
+        .await
+        .unwrap();
+        let page = sm
+            .list_messages_paged(
+                &session_id,
+                MessageHistoryPageQuery {
+                    page_size: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        sm.update_tool_request_meta(
+            &session_id,
+            "tool-call",
+            serde_json::json!({"title": "Persisted title"}),
+        )
+        .await
+        .unwrap();
+        let error = sm
+            .list_messages_paged(
+                &session_id,
+                MessageHistoryPageQuery {
+                    cursor: page.next_cursor,
+                    page_size: Some(1),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_history_page_error(error, MessageHistoryPageError::StaleRevision);
+    }
+
+    #[tokio::test]
+    async fn message_history_no_op_mutations_preserve_revision() {
+        let temp_dir = TempDir::new().unwrap();
+        let sm = SessionManager::new(temp_dir.path().to_path_buf());
+        let session_id = create_message_history_test_session(&sm).await;
+        use rmcp::model::CallToolRequestParams;
+        sm.add_message(
+            &session_id,
+            &Message::assistant().with_id("plain").with_text("plain"),
+        )
+        .await
+        .unwrap();
+        sm.add_message(
+            &session_id,
+            &Message::assistant()
+                .with_id("tool-message")
+                .with_tool_request("tool-call", Ok(CallToolRequestParams::new("shell"))),
+        )
+        .await
+        .unwrap();
+
+        let initial = sm
+            .list_messages_paged(&session_id, MessageHistoryPageQuery::default())
+            .await
+            .unwrap();
+        sm.update_message_metadata(&session_id, "plain", |metadata| metadata)
+            .await
+            .unwrap();
+        let after_metadata = sm
+            .list_messages_paged(&session_id, MessageHistoryPageQuery::default())
+            .await
+            .unwrap();
+        assert_eq!(after_metadata.history_revision, initial.history_revision);
+
+        let patch = serde_json::json!({"title": "Persisted title"});
+        sm.update_tool_request_meta(&session_id, "tool-call", patch.clone())
+            .await
+            .unwrap();
+        let after_first_patch = sm
+            .list_messages_paged(&session_id, MessageHistoryPageQuery::default())
+            .await
+            .unwrap();
+        assert_ne!(
+            after_first_patch.history_revision,
+            after_metadata.history_revision
+        );
+        sm.update_tool_request_meta(&session_id, "tool-call", patch)
+            .await
+            .unwrap();
+        let after_same_patch = sm
+            .list_messages_paged(&session_id, MessageHistoryPageQuery::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            after_same_patch.history_revision,
+            after_first_patch.history_revision
+        );
+    }
+
+    #[tokio::test]
+    async fn message_history_deleted_and_recreated_session_rejects_old_cursor() {
+        let temp_dir = TempDir::new().unwrap();
+        let sm = SessionManager::new(temp_dir.path().to_path_buf());
+        let session_id = create_message_history_test_session(&sm).await;
+        add_history_message(&sm, &session_id, "old-a", "old-a", 1_000).await;
+        add_history_message(&sm, &session_id, "old-b", "old-b", 1_001).await;
+        let page = sm
+            .list_messages_paged(
+                &session_id,
+                MessageHistoryPageQuery {
+                    page_size: Some(1),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        sm.delete_session(&session_id).await.unwrap();
+        let error = sm
+            .list_messages_paged(
+                &session_id,
+                MessageHistoryPageQuery {
+                    cursor: page.next_cursor.clone(),
+                    page_size: Some(1),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_history_page_error(error, MessageHistoryPageError::SessionNotFound);
+        let recreated = create_message_history_test_session(&sm).await;
+        assert_eq!(recreated, session_id);
+        add_history_message(&sm, &recreated, "new", "new", 1_000).await;
+        let error = sm
+            .list_messages_paged(
+                &recreated,
+                MessageHistoryPageQuery {
+                    cursor: page.next_cursor,
+                    page_size: Some(1),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_history_page_error(error, MessageHistoryPageError::StaleRevision);
+    }
+
+    #[tokio::test]
+    async fn message_history_validates_limits_and_malformed_cursors() {
+        let temp_dir = TempDir::new().unwrap();
+        let sm = SessionManager::new(temp_dir.path().to_path_buf());
+        let session_id = create_message_history_test_session(&sm).await;
+        sm.storage().reset_message_history_page_metrics();
+        for page_size in [0, MAX_MESSAGE_HISTORY_PAGE_SIZE + 1] {
+            let error = sm
+                .list_messages_paged(
+                    &session_id,
+                    MessageHistoryPageQuery {
+                        page_size: Some(page_size),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert_history_page_error(error, MessageHistoryPageError::InvalidPageSize);
+        }
+        assert_eq!(
+            sm.storage().message_history_page_metrics(),
+            MessageHistoryPageMetrics::default()
+        );
+        for index in 0..26 {
+            add_history_message(
+                &sm,
+                &session_id,
+                &format!("default-{index}"),
+                &format!("default-{index}"),
+                index,
+            )
+            .await;
+        }
+        let default_page = sm
+            .list_messages_paged(&session_id, MessageHistoryPageQuery::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            default_page.messages.len(),
+            DEFAULT_MESSAGE_HISTORY_PAGE_SIZE
+        );
+        assert!(default_page.next_cursor.is_some());
+
+        let maximum_page = sm
+            .list_messages_paged(
+                &session_id,
+                MessageHistoryPageQuery {
+                    page_size: Some(MAX_MESSAGE_HISTORY_PAGE_SIZE),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(maximum_page.messages.len(), 26);
+        assert!(maximum_page.next_cursor.is_none());
+
+        let malformed: MessageHistoryCursor = serde_json::from_str("\"not-a-cursor\"").unwrap();
+        let error = sm
+            .list_messages_paged(
+                &session_id,
+                MessageHistoryPageQuery {
+                    cursor: Some(malformed),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_history_page_error(error, MessageHistoryPageError::InvalidCursor);
+    }
+
+    #[tokio::test]
+    async fn message_history_page_decoding_is_bounded_by_limit() {
+        let temp_dir = TempDir::new().unwrap();
+        let sm = SessionManager::new(temp_dir.path().to_path_buf());
+        let session_id = create_message_history_test_session(&sm).await;
+        let pool = sm.storage().pool().await.unwrap();
+        sqlx::query(
+            "INSERT INTO messages (session_id, role, content_json, created_timestamp, metadata_json) VALUES (?, 'user', 'invalid-json', 0, '{}')",
+        )
+        .bind(&session_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        for index in 0..5 {
+            add_history_message(
+                &sm,
+                &session_id,
+                &format!("valid-{index}"),
+                &format!("valid-{index}"),
+                100 + index,
+            )
+            .await;
+        }
+
+        let first = sm
+            .list_messages_paged(
+                &session_id,
+                MessageHistoryPageQuery {
+                    page_size: Some(3),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(history_page_texts(&first).len(), 3);
+        assert!(sm
+            .list_messages_paged(
+                &session_id,
+                MessageHistoryPageQuery {
+                    cursor: first.next_cursor,
+                    page_size: Some(3),
+                },
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn message_history_page_uses_two_bounded_selects() {
+        let temp_dir = TempDir::new().unwrap();
+        let sm = SessionManager::new(temp_dir.path().to_path_buf());
+        let session_id = create_message_history_test_session(&sm).await;
+        let pool = sm.storage().pool().await.unwrap();
+        let content = serde_json::to_string(&Message::user().with_text("row").content).unwrap();
+        let metadata =
+            serde_json::to_string(&crate::conversation::message::MessageMetadata::default())
+                .unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        for created_timestamp in 0..1_000 {
+            sqlx::query(
+                "INSERT INTO messages (session_id, role, content_json, created_timestamp, metadata_json) VALUES (?, 'user', ?, ?, ?)",
+            )
+            .bind(&session_id)
+            .bind(&content)
+            .bind(created_timestamp)
+            .bind(&metadata)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        }
+        tx.commit().await.unwrap();
+
+        sm.storage().reset_message_history_page_metrics();
+        let page = sm
+            .list_messages_paged(
+                &session_id,
+                MessageHistoryPageQuery {
+                    page_size: Some(3),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.messages.len(), 3);
+        assert_eq!(
+            sm.storage().message_history_page_metrics(),
+            MessageHistoryPageMetrics {
+                select_count: 2,
+                rows_returned: 5,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn message_history_schema_migrates_and_uses_composite_index() {
+        let temp_dir = TempDir::new().unwrap();
+        let data_dir = temp_dir.path().to_path_buf();
+        let sm = SessionManager::new(data_dir.clone());
+        let session_id = create_message_history_test_session(&sm).await;
+        add_history_message(&sm, &session_id, "existing", "existing", 1_000).await;
+        let pool = sm.storage().pool().await.unwrap();
+        demote_message_history_schema_to_v16(pool).await;
+        pool.close().await;
+        drop(sm);
+
+        let migrated = SessionManager::new(data_dir);
+        let page = migrated
+            .list_messages_paged(&session_id, MessageHistoryPageQuery::default())
+            .await
+            .unwrap();
+        assert_eq!(history_page_texts(&page), ["existing"]);
+        let pool = migrated.storage().pool().await.unwrap();
+        let index_columns = sqlx::query_scalar::<_, String>(
+            "SELECT name FROM pragma_index_info('idx_messages_session_created') ORDER BY seqno",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        assert_eq!(index_columns, ["session_id", "created_timestamp", "id"]);
+
+        let plan = sqlx::query_as::<_, (i64, i64, i64, String)>(
+            "EXPLAIN QUERY PLAN SELECT id FROM messages WHERE session_id = ? AND (created_timestamp < ? OR (created_timestamp = ? AND id < ?)) ORDER BY created_timestamp DESC, id DESC LIMIT 4",
+        )
+        .bind(&session_id)
+        .bind(i64::MAX)
+        .bind(i64::MAX)
+        .bind(i64::MAX)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        assert!(plan
+            .iter()
+            .any(|(_, _, _, detail)| detail.contains("idx_messages_session_created")));
+        assert!(plan
+            .iter()
+            .all(|(_, _, _, detail)| !detail.contains("USE TEMP B-TREE")));
+    }
+
+    #[tokio::test]
+    async fn message_history_rejects_newer_schema_version() {
+        let temp_dir = TempDir::new().unwrap();
+        let data_dir = temp_dir.path().to_path_buf();
+        let sm = SessionManager::new(data_dir.clone());
+        let pool = sm.storage().pool().await.unwrap();
+        sqlx::query("INSERT INTO schema_version (version) VALUES (?)")
+            .bind(CURRENT_SCHEMA_VERSION + 1)
+            .execute(pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        drop(sm);
+
+        let newer_schema = SessionManager::new(data_dir);
+        let error = newer_schema.storage().pool().await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("is newer than supported version"));
+    }
+
+    #[tokio::test]
+    async fn message_history_migration_fences_already_open_older_writer() {
+        let temp_dir = TempDir::new().unwrap();
+        let data_dir = temp_dir.path().to_path_buf();
+        let sm = SessionManager::new(data_dir.clone());
+        let session_id = create_message_history_test_session(&sm).await;
+        add_history_message(&sm, &session_id, "existing", "existing", 1_000).await;
+        let pool = sm.storage().pool().await.unwrap();
+        demote_message_history_schema_to_v16(pool).await;
+        pool.close().await;
+        drop(sm);
+
+        let db_path = data_dir.join(SESSIONS_FOLDER).join(DB_NAME);
+        let older_pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(db_path)
+                    .foreign_keys(true),
+            )
+            .await
+            .unwrap();
+        let mut older_connection = older_pool.acquire().await.unwrap();
+        sqlx::query("SELECT 1")
+            .execute(&mut *older_connection)
+            .await
+            .unwrap();
+
+        let current = SessionManager::new(data_dir);
+        current.storage().pool().await.unwrap();
+
+        for statement in [
+            "INSERT INTO messages (session_id, role, content_json, created_timestamp, metadata_json) VALUES (?, 'user', '[]', 2000, '{}')",
+            "UPDATE messages SET content_json = '[]' WHERE session_id = ?",
+            "DELETE FROM messages WHERE session_id = ?",
+        ] {
+            assert!(sqlx::query(statement)
+                .bind(&session_id)
+                .execute(&mut *older_connection)
+                .await
+                .is_err());
+        }
+
+        current
+            .add_message(
+                &session_id,
+                &Message::user().with_id("current").with_text("current"),
+            )
+            .await
+            .unwrap();
+        let page = current
+            .list_messages_paged(&session_id, MessageHistoryPageQuery::default())
+            .await
+            .unwrap();
+        assert_eq!(history_page_texts(&page), ["current", "existing"]);
+    }
+
+    #[tokio::test]
+    async fn public_session_list_pager_filters_before_limit_and_binds_cursor() {
+        let temp_dir = TempDir::new().unwrap();
+        let sm = SessionManager::new(temp_dir.path().to_path_buf());
+        let first_id = create_session_for_list(&sm, "/project/a", true).await;
+        let _other_id = create_session_for_list(&sm, "/project/b", true).await;
+        let second_id = create_session_for_list(&sm, "/project/a", true).await;
+        let query = |cursor| SessionListPageQuery {
+            cursor,
+            page_size: Some(1),
+            working_dir: Some(PathBuf::from("/project/a")),
+            session_types: Some(vec![SessionType::User]),
+            only_sessions_with_messages: true,
+            ..Default::default()
+        };
+        let first = sm.list_sessions_paged(query(None)).await.unwrap();
+        assert_eq!(first.sessions.len(), 1);
+        let encoded_cursor = first.next_cursor.clone().unwrap();
+        assert_eq!(
+            encoded_cursor.to_string().parse::<SessionListCursor>(),
+            Ok(encoded_cursor.clone())
+        );
+        let second = sm
+            .list_sessions_paged(query(first.next_cursor.clone()))
+            .await
+            .unwrap();
+        let returned = [first.sessions[0].id.clone(), second.sessions[0].id.clone()];
+        assert!(returned.contains(&first_id));
+        assert!(returned.contains(&second_id));
+        assert!(second.next_cursor.is_none());
+
+        let error = sm
+            .list_sessions_paged(SessionListPageQuery {
+                cursor: first.next_cursor,
+                page_size: Some(1),
+                working_dir: Some(PathBuf::from("/project/b")),
+                session_types: Some(vec![SessionType::User]),
+                only_sessions_with_messages: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<SessionListPageError>(),
+            Some(&SessionListPageError::CursorFilterMismatch)
+        );
+        let error = sm
+            .list_sessions_paged(SessionListPageQuery {
+                page_size: Some(MAX_SESSION_LIST_PAGE_SIZE + 1),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<SessionListPageError>(),
+            Some(&SessionListPageError::InvalidPageSize)
+        );
+    }
+
+    #[tokio::test]
+    async fn public_session_list_pager_defaults_to_twenty_five() {
+        let temp_dir = TempDir::new().unwrap();
+        let sm = SessionManager::new(temp_dir.path().to_path_buf());
+        for _ in 0..26 {
+            create_session_for_list(&sm, "/project/default-page", true).await;
+        }
+        let page = sm
+            .list_sessions_paged(SessionListPageQuery {
+                working_dir: Some(PathBuf::from("/project/default-page")),
+                session_types: Some(vec![SessionType::User]),
+                only_sessions_with_messages: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.sessions.len(), DEFAULT_SESSION_LIST_PAGE_SIZE);
+        assert!(page.next_cursor.is_some());
     }
 }

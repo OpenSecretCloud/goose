@@ -159,7 +159,7 @@ mod tests {
     use crate::config::GooseMode;
     use crate::conversation::message::{MessageContent, MessageMetadata};
     use crate::session::session_manager::{
-        SessionListFilters, SessionListPageQuery, SessionManager, SessionType,
+        SessionListFilters, SessionListStoragePageQuery, SessionManager, SessionType,
     };
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
@@ -178,7 +178,7 @@ mod tests {
 
     async fn listed_snippets(sm: &SessionManager) -> HashMap<String, Option<String>> {
         let types = [SessionType::User];
-        sm.list_sessions_paged(SessionListPageQuery {
+        sm.list_sessions_storage_paged(SessionListStoragePageQuery {
             filters: SessionListFilters {
                 types: Some(&types),
                 working_dir: Some(Path::new("/tmp/snippet")),
